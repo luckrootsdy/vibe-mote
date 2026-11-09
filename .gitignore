@@ -46,5 +46,10 @@ client.log*
 _*.json
 .last_heal
 
+# 例外：这两个是正经功能脚本，被「重启遥控器.bat」直接调用，必须进仓库
+!重启遥控器.bat
+!_重启遥控器.ps1
+!_自愈重启.ps1
+
 # VB-CABLE 安装器：第三方二进制，不随仓库分发（用户自行从 vb-audio.com 下载）
 vbcable/
