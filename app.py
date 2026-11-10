@@ -115,8 +115,10 @@ DEFAULT_CONFIG = {
               #   等价于运行「重启遥控器.bat"）。
               "auto_heal_on_key": True,
               # heal 的方式："refresh"=只重建语音链路 / "restart"=重启整个客户端 /
-              # "auto"=先 refresh，还未连再 restart
-              "heal_mode": "auto",
+              # "auto"=先 refresh，还未连再 restart。出厂默认 restart：用户反映
+              # refresh 有时还是不够彻底，直接重启整个客户端（等价运行「重启遥控器.bat"）
+              # 最能保证"拿起来就用"。
+              "heal_mode": "restart",
               # 同一次按键爆发内只恢复一次的冷却秒，避免用户连续按键触发重复重启
               "heal_cooldown": 30},
     "audio": {"gain": 4.0, "agc": True, "relay": True},
@@ -370,7 +372,7 @@ def save_config(cfg):
                       "worker": bool(v.get("worker", False)),
                       # ★ 2026-11-11：按键自动恢复（三项同理，必须进白名单）。
                       "auto_heal_on_key": bool(v.get("auto_heal_on_key", True)),
-                      "heal_mode": str(v.get("heal_mode") or "auto"),
+                      "heal_mode": str(v.get("heal_mode") or "restart"),
                       "heal_cooldown": int(v.get("heal_cooldown") or 30)}
     # 语音键手势（升级功能）：长按 / 双击各配一个「点按」规格，字段形状同 voice 自己
     #   {"mode": "tap", "key": "F10", "mods": ["CTRL"]}
