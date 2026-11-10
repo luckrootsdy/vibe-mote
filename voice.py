@@ -1739,13 +1739,30 @@ class VoiceRole(threading.Thread):
 
         disc = asyncio.Event()
 
-        def on_disc(_c):
-            loop.call_soon_threadsafe(disc.set)
+        def on_disc():
+            # ★★ 2026-11-10 小柯（真机日志实锤）★★
+            #   bleak-winrt 调这个回调时**不带参数**（client.py:304 / 477 都是
+            #   `self._disconnected_callback()`）。原来写成 `on_disc(_c)`，于是每次
+            #   掉线都抛 TypeError，而且抛在 bleak 紧接着的 `handle_disconnect()` **之前**：
+            #     · services / _session 不会被释放（旧会话一直挂着）；
+            #     · is_connected 还可能返回旧值；
+            #   结果就是：写心跳报 "Not connected"、重连又被设备当成"第二个客户端"
+            #   （只给 4 个基础服务）—— 正是"用着用着断、断了很难连回来"的机械原因。
+            #   真机证据：10:11:17 语音worker(stderr) TypeError: on_disc() missing 1
+            #   required positional argument: '_c'。
+            try:
+                loop.call_soon_threadsafe(disc.set)
+            except Exception:
+                pass
 
+        # 用官方接口注册（0 参数回调）；没有这个方法再退回内部字段。
         try:
-            client._backend._disconnected_callback = on_disc      # 兜底
+            client.set_disconnected_callback(on_disc)
         except Exception:
-            pass
+            try:
+                client._backend._disconnected_callback = on_disc
+            except Exception:
+                pass
 
         # 用轮询 + 断线事件维持会话：任何一边退出就结束本次会话
         # ★ 2026-11-09 保活（"开机好好的、一会儿就不行了"的根治手段）
