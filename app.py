@@ -50,7 +50,7 @@ if HERE not in sys.path:
 import i18n  # noqa: E402  （必须在 sys.path 之后就位）
 
 APP_NAME = "VibeMote"
-APP_VERSION = "1.2.1"          # 报 bug 时请带上这个版本号（界面「设置 → 界面」能看到）
+APP_VERSION = "1.2.2"          # 报 bug 时请带上这个版本号（界面「设置 → 界面」能看到）
 WEB = os.path.join(HERE, "web")
 CONFIG = os.path.join(HERE, "config.json")
 REQUIREMENTS = os.path.join(HERE, "requirements.txt")
@@ -72,6 +72,11 @@ RUNSTATE = os.path.join(HERE, "_run_state.txt")
 #   老的自愈脚本就是这么漏掉旧实例的：只杀了 stub，子进程活着继续抢蓝牙，
 #   遥控器只肯给 4 个基础服务 —— 表现为"越自愈越坏"。
 APPPID = os.path.join(HERE, "_app_pid.txt")
+
+# ★ 2026-11-10 小柯：自动恢复的"已经重启过几次"必须**跨进程**记住。
+#   否则每次自重启后新进程的计数从 0 开始 → 遥控器一直不在（比如用户出门了）
+#   就会变成"每 10 分钟重启一次客户端"的死循环。连上一次就把这个文件删掉。
+RECOVERY_STATE = os.path.join(HERE, "_auto_recovery.json")
 
 DEFAULT_PORT = 8787
 CREATE_NO_WINDOW = 0x08000000
@@ -1262,6 +1267,29 @@ def best_pythonw():
     return w if os.path.exists(w) else sys.executable
 
 
+def launch_new_instance():
+    """拉起一个新实例（`--takeover` 会结束旧的我），返回 (ok, 说明)。
+
+    ★ 2026-11-10 小柯：从 restart-app 动作里抽出来，给"自动恢复阶梯"复用 ——
+      用户手动点「重启」和看门狗自动重启必须走**同一条**代码，否则迟早出现
+      "点按钮能救、自动救不了"这种只能靠人守着的差别。
+
+    `ShellExecuteW` 而不是 `subprocess.Popen`：提权运行时子进程会继承管理员令牌，
+    而 ShellExecute 走 shell，权限/窗口/工作目录都跟启动器双击一致。
+    """
+    import ctypes
+    exe = best_pythonw()
+    params = f'"{os.path.join(HERE, "app.py")}" --silent --takeover'
+    try:
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "open", exe, params, HERE, 0)
+    except Exception as e:
+        return False, i18n.L(f"重启失败：{e!r}", f"Restart failed: {e!r}")
+    if rc <= 32:
+        return False, i18n.L(f"重启失败（返回码 {rc}）",
+                             f"Restart failed (return code {rc})")
+    return True, exe
+
+
 def relaunch_elevated():
     """以管理员身份重新拉起自己 —— **只会弹一次 UAC**。
 
@@ -1786,6 +1814,65 @@ def make_voice(cfg, on_event):
     return voice_mod.VoiceRole(on_event, **kw)
 
 
+# 「自动恢复阶梯」的判据（纯函数，便于单测）。
+# ★ 为什么不要求"用户最近确实按过键"：连不上的时候遥控器的按键**根本到不了**
+#   我们这里（按键报文走 BLE，链路断了就没有），要求它就等于永远不升级 —— 而用户
+#   恰恰是在"按了半天没反应"的时候最需要自动重启。改用一个有界策略兜住误判：
+#   一轮"连不上"最多重启 3 次、每次间隔 ≥10 分钟，连上立刻清零。
+ESC_AFTER = 180.0        # 连续没连上多久才升级到"重启整个客户端"
+ESC_GAP = 600.0          # 两次自动重启之间至少隔 10 分钟
+ESC_MAX = 3              # 一轮"连不上"里最多自动重启 3 次
+ESC_MIN_RESPAWNS = 2     # 至少已经换过 2 次 worker 进程（说明换进程这招已经用尽）
+
+
+def watch_escalate(down_secs, respawns, esc_count, since_last,
+                   after=ESC_AFTER, gap=ESC_GAP, max_esc=ESC_MAX,
+                   min_respawns=ESC_MIN_RESPAWNS):
+    """要不要把整个客户端重启一次？返回 True/False。
+
+    down_secs   —— 语音通道连续没连上多少秒
+    respawns    —— worker 已经换过多少次进程
+    esc_count   —— 这一轮"连不上"里已经自动重启过几次（**跨进程**，存在 RECOVERY_STATE）
+    since_last  —— 距上次自动重启多少秒（从没重启过就传一个大数）
+    """
+    try:
+        if esc_count >= max_esc:
+            return False
+        if since_last < gap:
+            return False
+        if respawns < min_respawns:
+            return False
+        return down_secs >= after
+    except (TypeError, ValueError):
+        return False
+
+
+def read_recovery_state():
+    """读"自动重启过几次"。返回 (count, last_epoch)，读不到就是 (0, 0.0)。"""
+    try:
+        with open(RECOVERY_STATE, encoding="utf-8") as f:
+            d = json.load(f)
+        return int(d.get("count") or 0), float(d.get("last") or 0.0)
+    except Exception:
+        return 0, 0.0
+
+
+def write_recovery_state(count, last):
+    try:
+        with open(RECOVERY_STATE, "w", encoding="utf-8") as f:
+            json.dump({"count": int(count), "last": float(last)}, f)
+    except Exception:
+        pass
+
+
+def clear_recovery_state():
+    try:
+        if os.path.exists(RECOVERY_STATE):
+            os.remove(RECOVERY_STATE)
+    except Exception:
+        pass
+
+
 class Roles:
     """把语音和按键两个角色装在本进程的线程里，并提供启动/停止/重启。"""
 
@@ -1950,15 +2037,31 @@ class Roles:
              · "空闲 2 分钟主动重建"正好撞上遥控器自己约 3 分钟的半睡，
                等于每 2 分钟主动踩一次坑；
              · 网页端还有一条同样的 15 秒自动 restart，三者叠加就是重启风暴。
-           现在只做两件事：
-             · 通道断了 → `poke()`：让语音线程**立刻**重试（退避封顶 10 秒），
+           现在只做三件事：
+             · 通道断了 → `poke("watchdog")`：让语音线程**立刻**重试（退避封顶 10 秒），
                不动角色、不动进程、不动按键映射；
-             · 语音线程真的退出（缺依赖之类）→ 重建一次，5 分钟限流。
+             · 语音线程真的退出（缺依赖之类）→ 重建一次，5 分钟限流；
+             · ★ 2026-11-10 阶梯 ②：连不上太久、而且 worker 已经换过 ≥2 次进程还是不行
+               → **自动重启整个客户端**（等价于用户手动运行「重启遥控器」）。
+               真机数据：11:37:42~11:46:36 那次"连不上"爆发持续 534 秒，用户按了半天
+               语音键毫无反应，最后靠手动重启才回来。这条阶梯就是替代那只手的。
+               限流：一轮"连不上"里最多自动重启 3 次、每次间隔 ≥10 分钟；连上就清零。
            能叫醒遥控器的只有它自己的物理按键（HID 报文走系统蓝牙栈），软件侧
-           没有通道；所以这里不再假装能"自愈"，只保证"它一醒我们就抓住"。
+           没有通道；所以这里不假装能"叫醒设备"，只保证"它一醒我们就抓住"。
         """
         miss = 0
         last_rebuild = 0.0
+        down_since = 0.0            # 「连续没连上」的起点（连上就清零）
+        # ★ 计数必须跨进程（RECOVERY_STATE）：自重启之后新进程还要记得"已经试过几次"，
+        #   否则遥控器一直不在时会每 10 分钟重启一次客户端。
+        esc_count, last_esc = read_recovery_state()
+        if esc_count:
+            BUS.log(i18n.L(
+                f"语音看门狗：上次自动重启过 {esc_count} 次还没连上过（上限 {ESC_MAX} 次）"
+                f"—— 连上会自动清零；现在继续用当前进程重试",
+                f"Voice watchdog: auto-restarted {esc_count} time(s) without a successful "
+                f"connection yet (cap {ESC_MAX}) — a successful connect clears it; retrying "
+                f"in this process for now"))
         while not getattr(self, "_watch_stop", False):
             time.sleep(5)
             try:
@@ -1966,6 +2069,7 @@ class Roles:
                     v = self.voice
                 if v is None:
                     miss = 0
+                    down_since = 0.0
                     continue
                 # 1) 线程没了才重建（并且限流，避免"重建-退出-重建"死循环）
                 if not v.is_alive():
@@ -1977,25 +2081,86 @@ class Roles:
                             "Voice watchdog: voice thread exited — rebuilding once"))
                         self.refresh_voice()
                     miss = 0
+                    down_since = 0.0
                     continue
-                # 2) 只是没连上 → 催它重试，不重建
                 connected = bool(getattr(v, "connected", False))
                 ready = bool(getattr(v, "ready", False))
-                if ready and not connected:
+                now = time.time()
+                if connected:
+                    miss = 0
+                    down_since = 0.0
+                    if esc_count:
+                        esc_count = 0
+                        clear_recovery_state()
+                        BUS.log(i18n.L(
+                            "语音看门狗：连上了 —— 自动重启的计数已清零",
+                            "Voice watchdog: connected — auto-restart counter cleared"))
+                    continue
+                if not down_since:
+                    down_since = now
+                # 2) 只是没连上 → 催它重试，不重建
+                if ready:
                     miss += 1
                     if miss >= 2:                 # 10 秒没连上就催一次
                         miss = 0
                         try:
-                            v.poke()
+                            v.poke("watchdog")
                         except Exception:
                             pass
                 else:
                     miss = 0
+                # 3) 阶梯 ②：换进程也没用 → 重启整个客户端
+                respawns = int(getattr(v, "respawns", 0) or 0)
+                since_last = (now - last_esc) if last_esc else 1e9
+                down = now - down_since
+                if watch_escalate(down, respawns, esc_count, since_last):
+                    last_esc = now
+                    # 先落盘再重启：新进程要能从文件里读出"已经试过几次"。
+                    write_recovery_state(esc_count + 1, now)
+                    ok = self._auto_restart_self(i18n.L(
+                        f"语音通道已经连续 {down:.0f} 秒连不上，"
+                        f"期间换过 {respawns} 次 worker 进程都没救回来",
+                        f"the voice link has been down for {down:.0f}s and "
+                        f"{respawns} worker respawns did not help"))
+                    if ok:
+                        return
+                    esc_count += 1
             except Exception as e:
                 try:
                     BUS.log(f"语音看门狗：{type(e).__name__}: {e}")
                 except Exception:
                     pass
+
+    def _auto_restart_self(self, why=""):
+        """阶梯 ②：把整个客户端重启一次（= 用户手动运行「重启遥控器」）。
+
+        ★ 顺序很重要：**先**把 BLE 放干净，**再**拉新实例。反过来（新实例先起来）
+          会出现两个进程抢同一条 BLE 连接，遥控器只给 4 个基础服务 —— 那正是
+          我们花一整天在治的病。
+        ★ 失败就退回当前进程继续重试（并把语音角色重建起来），绝不留下"什么都没了"。
+        """
+        BUS.log(i18n.L(
+            f"自动恢复：{why} —— 正在重启整个客户端"
+            f"（不用你点任何东西，约 5~10 秒后自己回来）",
+            f"Auto recovery: {why} — restarting the whole client "
+            f"(nothing to click; it returns in 5~10s)"))
+        try:
+            self.stop(quiet=True)
+        except Exception:
+            pass
+        ok, msg = launch_new_instance()
+        if not ok:
+            BUS.log(i18n.L(
+                f"自动重启失败：{msg} —— 继续用当前进程重试连接",
+                f"Auto restart failed: {msg} — keeping this process and retrying"))
+            try:
+                self.start()
+            except Exception:
+                pass
+            return False
+        time.sleep(0.4)
+        os._exit(0)
+        return True
 
     def apply_config(self, cfg):
         """配置保存后热更新：映射即时生效，不用重启。
@@ -3009,38 +3174,27 @@ class Handler(BaseHTTPRequestHandler):
         if act == "restart-app":
             # 「重启自己」：用**启动器那套优先级**挑解释器（优先 .venv），
             # 拉起同样权限的新实例（--takeover 会结束旧的我），然后退出。
-            import ctypes
-            exe = best_pythonw()
-            params = f'"{os.path.join(HERE, "app.py")}" --silent --takeover'
-            try:
-                if is_elevated():
-                    rc = ctypes.windll.shell32.ShellExecuteW(None, "open", exe,
-                                                             params, HERE, 0)
-                else:
-                    rc = ctypes.windll.shell32.ShellExecuteW(None, "open", exe,
-                                                             params, HERE, 0)
-            except Exception as e:
-                return self._json({"ok": False, "msg": i18n.L(
-                    f"重启失败：{e!r}", f"Restart failed: {e!r}")})
-            if rc <= 32:
-                return self._json({"ok": False, "msg": i18n.L(
-                    f"重启失败（返回码 {rc}）",
-                    f"Restart failed (return code {rc})")})
+            ok, msg = launch_new_instance()
+            if not ok:
+                return self._json({"ok": False, "msg": msg})
+            exe = msg
             BUS.log(i18n.L(
                 f"正在重启客户端（用 {os.path.basename(exe)} 拉起新实例）…",
                 f"Restarting the client (launching a new instance with "
                 f"{os.path.basename(exe)})…"))
             def _bye():
-                time.sleep(2.5)
-                # ★ 2026-11-10 小柯：退出前把语音 worker 停干净。
+                # ★ 2026-11-10 小柯：**先**把语音 worker 停干净，再退出。
                 #   worker 手里的 GATT 如果是被硬杀掉的，遥控器会认为"还有客户端在"，
                 #   新实例连上去又只剩 1800/1801/180a/180f 四个基础服务 —— 正好是
-                #   我们花一整天在治的那个病。所以宁可多等这 3 秒。
+                #   我们花一整天在治的那个病。原来先 sleep 2.5 秒，新实例的接管
+                #   有可能在这之前就把我杀了（taskkill 不带 /T，worker 会成孤儿、
+                #   继续攥着 BLE）。现在停干净只多花 0.3~3 秒，值得。
                 try:
                     if ROLES:
                         ROLES.stop(quiet=True)
                 except Exception:
                     pass
+                time.sleep(0.5)
                 os._exit(0)
 
             threading.Thread(target=_bye, daemon=True).start()
@@ -3235,6 +3389,43 @@ def our_instances(procs=None):
                 cur = by_pid.get(cur, (0, ""))[0]
                 hops += 1
     return sorted(out)
+
+
+def kill_orphan_voice_workers(procs=None):
+    """结束上一份实例遗留的 voice_worker 进程 —— 它们还攥着 BLE 连接。
+
+    ★ 2026-11-10 小柯：为什么需要。重启客户端是「新实例先起来 → 接管模式 taskkill
+      旧实例」，而 taskkill **故意不带 /T**（怕连坐杀掉用户正在跑的卸载脚本），
+      所以旧实例的 worker（孙子进程）可能活下来，继续握着唯一那条 BLE 连接：
+      新实例连上去只剩 4 个基础服务，日志刷「缺少 ATVV 特征」—— 正是这一天在治的病。
+      现在由**拿到单实例锁的**新实例在启动前统一清一遍（那时它一定是孤儿）。
+    只认命令行里带**本目录** voice_worker.py 的进程，别的目录的 vibe-mote 一概不碰。
+    """
+    if procs is None:
+        procs = python_processes()
+    mine = os.path.normcase(os.path.join(HERE, "voice_worker.py"))
+    keep = {os.getpid(), os.getppid()}
+    killed = []
+    for pid, ppid, cmd in procs:
+        if pid in keep or not cmd:
+            continue
+        low = os.path.normcase(cmd)
+        if "voice_worker.py" not in low or mine not in low:
+            continue
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                           creationflags=CREATE_NO_WINDOW, timeout=15)
+            killed.append(pid)
+        except Exception:
+            pass
+    if killed:
+        BUS.log(i18n.L(
+            f"清理了上一份实例遗留的语音 worker 进程 {killed} —— 它还攥着蓝牙连接，"
+            f"不清理的话新实例只会拿到 4 个基础服务",
+            f"Killed leftover voice worker process(es) {killed} from a previous instance — "
+            f"it still held the Bluetooth link, which would leave this instance with only "
+            f"the 4 base services"))
+    return killed
 
 
 def take_lock():
@@ -3456,6 +3647,15 @@ def main():
                 + i18n.L("（界面里点「安装基础依赖」即可，不影响先打开界面）",
                          " (click “Install base dependencies” in the UI — the UI opens "
                          "without them)"))
+
+    # ★ 2026-11-10 小柯：先把上一份实例遗留的 voice_worker 清掉。
+    #   走到这里说明我们已经拿到单实例锁（= 我们是唯一的客户端），所以命令行里
+    #   带本目录 voice_worker.py 的进程一定是**上一个实例的孤儿**。它们还攥着
+    #   唯一那条 BLE 连接：不清掉的话新实例连上去只剩 4 个基础服务。
+    try:
+        kill_orphan_voice_workers()
+    except Exception as e:
+        BUS.log(f"清理遗留语音 worker 失败（不影响启动）：{type(e).__name__}: {e}")
 
     ROLES = Roles(cfg)
 

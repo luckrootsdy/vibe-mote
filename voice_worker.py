@@ -15,11 +15,15 @@ Windows 的 WinRT 蓝牙设备对象一旦建起来，它内部的 GATT 服务�
   · worker 的 stdout 每行一个 JSON，主进程读它来更新界面和日志；
   · 主进程往 stdin 写 poke / stop / addr / spec，worker 收到立刻照办；
   · worker 发现"连上了、但连续 20 秒（或累计 3 次）只剩 4 个基础服务"→ **自己退出**，
-    主进程换一个全新的进程，新进程第一次枚举就是完整 8 个服务。
+    主进程换一个全新的进程，新进程第一次枚举就是完整 8 个服务；
+  · worker 发现"连续 45 秒根本连不上"→ 也**自己退出**（退出码 4），主进程按
+    2/15/30/60/120 秒的阶梯换新进程 —— 真机数据：换进程后 8~9 秒就绪。
 
 【刻意不做的事】
-· 设备真睡（压根连不上）时**不**退出。小柯 34 次实测证明深睡时换进程完全无效，
-  换进程只会让按键映射闪一下。那种情况只能等遥控器上的物理按键（poke 会立刻重连）。
+· 换进程不是万能的：设备深睡时它救不回来（只能等遥控器上的物理按键）。但也不能
+  像 v1.2.1 之前那样"一个进程死等到底" —— 真机 11:37:42~11:46:36 死等了 534 秒，
+  用户按了半天语音键毫无反应。现在的取舍是：45 秒换一次进程，换不动就退避，
+  按键依然能立刻打断退避。
 · 不写文件、不碰注册表、不开端口 —— 它只做一件事：把语音通到虚拟声卡。
 """
 from __future__ import annotations
@@ -48,8 +52,43 @@ if HERE not in sys.path:
 FOUR_IDLE_LIMIT = 20.0
 FOUR_HITS_LIMIT = 3
 
+# ★ 2026-11-10 小柯：「连不上」也要换进程。
+#   真机数据（10:37:28 启动的那个实例，11:00~11:50）：
+#     掉线 4 次（10:59:43 / 11:14:36 / 11:27:25 / 11:37:36），之后"连不上"的爆发分别
+#     持续 281s / 157s / 4s / 534s，中间每 ~17 秒一轮
+#     「连接超时（3s）→ 扫一次 → 没扫到广播 → 连接超时（10s）」。
+#   两次长爆发都是**换了 worker 进程之后 8~9 秒内就绪**（11:04:34→11:04:36、
+#   11:17:25→11:17:27）；11:46:44 那次没换进程，纯靠重试在 534 秒后才自己连上。
+#   也就是说：一直不换进程 = 用户按半天语音键都没反应。45 秒的依据是一次正常重连
+#   只要 3~10 秒，连着 45 秒连不上，这个进程的 WinRT 快照基本就是坏的。
+#   退出码 4 专门表示这一类（见 main() 结尾），主进程据此走"换进程阶梯"。
+CONNECT_FAIL_LIMIT = 45.0
+
 _out_lock = threading.Lock()
 stop_flag = threading.Event()
+
+
+def judge(now, connected, four_at, four_hits, down_since,
+          four_idle=FOUR_IDLE_LIMIT, four_hits_limit=FOUR_HITS_LIMIT,
+          connect_fail=CONNECT_FAIL_LIMIT):
+    """worker 该不该退出、退出码是多少？返回 (why, code)，why 为空 = 继续干。
+
+    纯函数（不碰时间、不碰全局），单测直接喂数就行 —— 这段判据是"换进程"的全部
+    依据，改错一个数字就会变成"重启风暴"或"永远不换"，所以必须能脱离 BLE 测。
+
+      four_at     本轮**第一次**见到"只有 4 个基础服务"的时刻（0 = 没见过）
+      four_hits   本轮累计见到几次
+      down_since  连续没连上的起点（0 = 一直连着）
+    """
+    if connected:
+        return "", 0
+    if four_at and (now - four_at) >= four_idle:
+        return f"连续 {four_idle:.0f} 秒只有 4 个基础服务（ATVV 不在）", 3
+    if four_hits >= four_hits_limit:
+        return f"连续 {four_hits} 次只有 4 个基础服务（ATVV 不在）", 3
+    if down_since and (now - down_since) >= connect_fail:
+        return f"连续 {connect_fail:.0f} 秒连不上遥控器", 4
+    return "", 0
 
 
 def emit(obj):
@@ -165,7 +204,9 @@ def main():
                     obj = {"c": cmd}
                 c = str(obj.get("c") or "")
                 if c == "poke":
-                    role.poke()
+                    # ★ 2026-11-10 小柯：把 reason 一起传下去（watchdog = 看门狗定时催，
+                    #   不是用户按键），否则 worker 里的日志会继续说"遥控器有按键活动"。
+                    role.poke(str(obj.get("r") or "key"))
                     # ★ 2026-11-10 小柯：用户按键 = 遥控器现在醒着 = 抢连接的最佳时机。
                     #   如果这个进程已经连续见过 4 服务（≥2 次）却还没连上，说明它的
                     #   服务快照就是坏的 —— 留在原地再 poke 一百次也没用，只会错过窗口。
@@ -192,19 +233,25 @@ def main():
     t_in.start()
 
     why = "parent-stop"
+    code = 0
+    down_since = 0.0            # 「连续没连上」的起点（连上就清零）
     while not stop_flag.is_set():
         time.sleep(0.5)
         if not role.is_alive():
             why = "role-thread-ended"
+            code = 3
             break
+        now = time.time()
         if bool(getattr(role, "connected", False)):
+            down_since = 0.0
             continue
-        f = four_at[0]
-        if f and (time.time() - f) >= FOUR_IDLE_LIMIT:
-            why = f"连续 {FOUR_IDLE_LIMIT:.0f} 秒只有 4 个基础服务（ATVV 不在）"
-            break
-        if four_hits[0] >= FOUR_HITS_LIMIT:
-            why = f"连续 {four_hits[0]} 次只有 4 个基础服务（ATVV 不在）"
+        if not down_since:
+            down_since = now
+        # ★ 注意：只有 judge 给出理由时才覆盖 why —— 否则 "parent-stop" 会被空串
+        #   盖掉，退出码就从 0 变成 3（测试 test_worker_rc4 抓到的）。
+        _why, _code = judge(now, False, four_at[0], four_hits[0], down_since)
+        if _why:
+            why, code = _why, _code
             break
 
     if not why_box[0]:
@@ -216,7 +263,12 @@ def main():
         role.stop()
     except Exception:
         pass
-    return 0 if why == "parent-stop" else 3
+    if why == "parent-stop":
+        return 0
+    # 3 = 服务快照过期（4 个服务）；4 = 一直连不上 —— 两种都要换进程，只是退避不同。
+    if why.startswith("连续") and "连不上遥控器" in why:
+        return 4
+    return code or 3
 
 
 if __name__ == "__main__":

@@ -851,6 +851,7 @@ class VoiceRole(threading.Thread):
         self.voice = VoiceKey(self.voice_spec)
         self.stop_flag = threading.Event()
         self._poke = threading.Event()      # 遥控器有按键活动 → 立刻重试连接
+        self._poke_reason = "key"           # 谁发的 poke：key（真按键）/ watchdog（看门狗）
         self.sink = None
         self.relay_obj = None
         self.connected = False
@@ -900,13 +901,18 @@ class VoiceRole(threading.Thread):
         self._suppress = False        # 这一轮按下被判定为双击的第二下 → 什么都不做
 
     # ---------- 对外 ----------
-    def poke(self):
+    def poke(self, reason="key"):
         """遥控器刚有按键活动 —— 现在它醒着，立刻重试一次连接。
 
         为什么关键：BLE 外设只在刚醒的一小段时间里能被连上（之后又睡，
         或被系统 HID 拿走那唯一的连接），而失败退避要等 3~10 秒 ——
         靠"等"就可能把窗口错过去。按键钩子（keys.KeyTap.on_activity）负责叫醒这里。
+
+        ★ reason="watchdog" 只是看门狗定时催一下（每 10 秒一次），日志里要写清楚，
+          不能冒充"遥控器有按键活动" —— 真机 11:00~11:50 那 111 条"按键活动"
+          对应的 `[按键]` 行数是 0，纯属日志骗人。
         """
+        self._poke_reason = str(reason or "key")
         # ★ 2026-11-09：按键是**成功率最高**的时刻，顺手把"重新发现"的时间窗也清零，
         #   这样这一轮如果只看到 4 个服务，会立刻再试一次 UNCACHED（不必等 30 秒）。
         self._uncached_at = 0.0
@@ -1362,7 +1368,12 @@ class VoiceRole(threading.Thread):
                 await asyncio.sleep(0.2)
             if self._poke.is_set():
                 self._poke.clear()
-                self._log("语音：遥控器有按键活动 —— 不再退避，立刻重试连接")
+                if getattr(self, "_poke_reason", "key") == "watchdog":
+                    # 看门狗每 10 秒催一次；如果它也说"有按键活动"，日志就是假的
+                    # （真机 11:00~11:50 那 111 条"按键活动"里 `[按键]` 行数为 0）。
+                    self._log("语音：看门狗催一次重连（不是用户按键）—— 立刻重试")
+                else:
+                    self._log("语音：遥控器有按键活动 —— 不再退避，立刻重试连接")
 
     async def _device_with_details(self):
         """不靠广播拿到设备对象，塞进 BLEDevice.details。
@@ -2038,6 +2049,12 @@ class VoiceWorkerRole(threading.Thread):
         #   否则主线程会在刷新状态时抛 AttributeError、整个客户端起不来。
         self.voice = VoiceKey(self._voice_spec)
         self._recycles = 0                # 连续"4 个服务"回收的次数（用于退避）
+        # 「连不上」阶梯：worker 连续 45 秒连不上就退出（退出码 4），这里按
+        # 2/15/30/60/120 秒换新进程。_cf_level 是"连续第几次因为连不上换进程"，
+        # 一旦真的连上就清零（见 _handle 的 status 分支）。
+        self._cf_level = 0
+        self._respawns = 0                # 一共换过多少次 worker 进程（app 看门狗用它判阶梯）
+        self._poke_reason = "key"         # 最近一次 poke 是谁发的：key / watchdog
         self._last_recycle_at = 0.0
         self._child_pid = 0
         self._last_why = ""
@@ -2063,16 +2080,33 @@ class VoiceWorkerRole(threading.Thread):
         """至少起过一个 worker 进程、并且它报过 ready —— 看门狗据此决定要不要催。"""
         return self._ready
 
-    def poke(self):
+    @property
+    def respawns(self):
+        """换过多少次 worker 进程（不含第一次启动）。
+
+        app.py 的看门狗用它判断"是不是已经把换进程这招用尽了"：
+        连续换 2 次还是连不上，才值得动"重启整个客户端"那一步。
+        """
+        return self._respawns
+
+    def poke(self, reason="key"):
         """遥控器刚有按键活动：转发给 worker，让它**立刻**重试连接。
 
         为什么必须转发而不是本进程自己连：本进程根本不持有 BLE 连接。
         按键是唯一能叫醒遥控器的通道（HID 报文走系统蓝牙栈），所以这条链路
         必须通 —— 通了就是"按一下就好"。
+
+        ★ reason="watchdog" 时**不**打断退避：看门狗每 10 秒催一次，若它也置位
+          `_poke_evt`，60/120 秒的退避就永远走不完 → 每 10 秒换一个 worker 进程，
+          正是我们花一整天在治的"重启风暴"。
+        ★ reason 也要**转发给 worker**：worker 里的 VoiceRole 用它决定日志措辞
+          （原来不带 reason，worker 里照样打"遥控器有按键活动"，日志继续骗人）。
         """
+        self._poke_reason = str(reason or "key")
         # 先置位：万一 worker 进程不在（正在退避），监督者要能被打断、立刻重建。
-        self._poke_evt.set()
-        self._send({"c": "poke"})
+        if self._poke_reason != "watchdog":
+            self._poke_evt.set()
+        self._send({"c": "poke", "r": self._poke_reason})
 
     def set_addr(self, addr):
         new = (addr or "").strip()
@@ -2210,6 +2244,9 @@ class VoiceWorkerRole(threading.Thread):
         elif t == "status":
             p = obj.get("p") or {}
             self._connected = bool(p.get("connected"))
+            if self._connected:
+                # 真连上了 → 「连不上」阶梯从头算
+                self._cf_level = 0
             self._note = p.get("note") or self._note
             b = p.get("battery")
             if isinstance(b, int) and 0 <= b <= 100:
@@ -2306,8 +2343,23 @@ class VoiceWorkerRole(threading.Thread):
                 err_tail.clear()
 
             four_recycle = ("只有 4 个" in self._last_why) or (rc == 3)
+            # ★ 2026-11-10 小柯：「连不上」也算需要换进程（退出码 4）。
+            #   依据见 voice_worker.CONNECT_FAIL_LIMIT 的注释（两次长爆发都是换进程后
+            #   8~9 秒就绪；不换的那次死等 534 秒）。退避阶梯比"4 个服务"温和些：
+            #   第一次只等 2 秒（大多数情况这就够了），连续换不动才 15/30/60/120。
+            connect_fail = (rc == 4) or ("连不上遥控器" in self._last_why)
+            self._respawns += 1
             now = time.time()
-            if four_recycle:
+            if connect_fail:
+                self._recycles = 0
+                self._cf_level = min(self._cf_level + 1, 5)
+                delay = [2.0, 15.0, 30.0, 60.0, 120.0][self._cf_level - 1]
+                self._log(i18n.L(
+                    f"语音worker：{self._last_why} —— 换一个新进程去抢连接"
+                    f"（连续第 {self._cf_level} 次，{delay:.0f} 秒后起）",
+                    f"Voice worker: {self._last_why} — spawning a fresh process to grab the "
+                    f"link (attempt {self._cf_level}, in {delay:.0f}s)"))
+            elif four_recycle:
                 if now - self._last_recycle_at < 60.0:
                     self._recycles += 1          # 连续：不是快照问题，退避
                 else:
@@ -2355,6 +2407,8 @@ class VoiceWorkerRole(threading.Thread):
             if self._halt.is_set():
                 break
             if woke_by_key:
+                # 只有**真的按键**能走到这里（poke("watchdog") 不置位 _poke_evt，
+                # 否则 60/120 秒的退避永远走不完 → 每 10 秒换一个进程）。
                 self._log(i18n.L(
                     "语音worker：遥控器有按键活动 —— 打断退避，立刻重建连接进程",
                     "Voice worker: remote key activity — cutting the backoff short and "
