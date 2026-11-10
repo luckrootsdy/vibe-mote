@@ -50,7 +50,7 @@ if HERE not in sys.path:
 import i18n  # noqa: E402  （必须在 sys.path 之后就位）
 
 APP_NAME = "VibeMote"
-APP_VERSION = "1.2.0"          # 报 bug 时请带上这个版本号（界面「设置 → 界面」能看到）
+APP_VERSION = "1.2.1"          # 报 bug 时请带上这个版本号（界面「设置 → 界面」能看到）
 WEB = os.path.join(HERE, "web")
 CONFIG = os.path.join(HERE, "config.json")
 REQUIREMENTS = os.path.join(HERE, "requirements.txt")
@@ -2054,6 +2054,9 @@ def state_snapshot(cfg, roles=None):
             "mods": (cfg.get("voice") or {}).get("mods", []),
             "ready": bool(v and v.voice.ok),
             "connected": bool(v and v.connected),
+            # 遥控器电量（0~100 / None）。界面只用来"让人知道该换电池还是该看日志"，
+            # 后端任何逻辑都不读它 —— 读不到电量不影响语音。
+            "battery": getattr(v, "battery", None),
             "note": (v.note if v else i18n.L("未启动", "Not started")),
         },
         "keys": {

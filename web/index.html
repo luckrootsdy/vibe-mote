@@ -340,6 +340,8 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
 .srow .k{color:var(--muted);flex:0 0 108px}
 .srow .v{color:var(--fg);min-width:0;word-break:break-word;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .srow .sub{font-size:11.6px;color:var(--muted-2)}
+/* 电量偏低时把它标出来：这是"该换电池"而不是"软件坏了"的唯一硬证据 */
+.srow .sub.warn{color:var(--warn)}
 /* 小号按钮：给「首次准备」清单和行内动作用 */
 .btn.sm{font-size:12px;padding:5px 11px;border-radius:8px}
 /* 「首次准备」清单：标签要比普通 srow 宽（"虚拟声卡"这类名字放得下），右边挂按钮。
@@ -1126,6 +1128,8 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'st.notSet': '未设置',
       'st.connected': '已连接',
       'st.disconnected': '未连接',
+      'st.battery': '电量 {0}%',
+      'st.batteryLow': '电量 {0}%（偏低，建议换电池）',
       'st.voice': '语音通道',
       'st.keys': '按键通道',
       'st.bt': '蓝牙连接',
@@ -1518,6 +1522,8 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'st.notSet': 'Not set',
       'st.connected': 'Connected',
       'st.disconnected': 'Disconnected',
+      'st.battery': 'Battery {0}%',
+      'st.batteryLow': 'Battery {0}% (low — replace it)',
       'st.voice': 'Voice channel',
       'st.keys': 'Key channel',
       'st.bt': 'Bluetooth',
@@ -2190,6 +2196,13 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
     var connected = !!(voice.connected);
     btv.appendChild(dot(running && connected ? 'ok' : (running ? 'warn' : 'bad')));
     btv.appendChild(el('span', null, connected ? t('st.connected') : t('st.disconnected')));
+    // 电量：只在真的读到（0~100）时显示。它是"该换电池还是该查日志"的唯一硬证据，
+    // 所以偏低时直接标出来 —— 别让用户为 8% 的电量去怀疑软件。
+    if (typeof voice.battery === 'number') {
+      var low = voice.battery <= 20;
+      btv.appendChild(el('span', 'sub' + (low ? ' warn' : ''),
+        t(low ? 'st.batteryLow' : 'st.battery', voice.battery)));
+    }
     rows.appendChild(srow(t('st.bt'), btv));
 
     rows.appendChild(srow(t('st.autostart'), s.autostart ? t('st.on') : t('st.off')));

@@ -32,6 +32,17 @@ ATVV_CTL = "ab5e0002"
 ATVV_AUDIO = "ab5e0003"
 ATVV_STATUS = "ab5e0004"
 
+# 标准电量特征（Battery Level，0~100%）。它挂在 180f 服务下面，而 180f 是
+# **连"半睡"时都还在**的四个基础服务之一（1800/1801/180a/180f）——
+# 所以哪怕遥控器只给出 4 个服务、语音用不了，也照样能读到电量。
+# 有了它，"连不上"就能分成两种完全不同的结论：
+#   电量 8%  → 物理问题（电池），换电池，别再折腾软件；
+#   电量 92% → 软件/快照问题，继续按三态日志定位。
+BATT_LEVEL = "00002a19"
+# 电量多久刷新一次（秒）。10 分钟足够看出"一晚上掉 15%"这种趋势，
+# 又不会为了读一个字节去打扰遥控器。
+BATT_REFRESH = 600.0
+
 SR_IN, SR_OUT = 16000, 48000
 
 # 语音键手势的三个时间参数（毫秒）
@@ -844,6 +855,10 @@ class VoiceRole(threading.Thread):
         self.relay_obj = None
         self.connected = False
         self.note = i18n.L("未启动", "Not started")
+        # 遥控器电量（0~100，读不到就是 None）。纯诊断信息，绝不参与连接逻辑。
+        self.battery = None
+        self._battery_at = 0.0            # 上次成功读到电量的时间
+        self._batt_warned = False         # "读不到电量"只提示一次，别刷屏
         self.sessions = 0
         self.frames = 0
         self.misses = 0
@@ -1381,6 +1396,71 @@ class VoiceRole(threading.Thread):
         mac = ":".join(h[i:i + 2] for i in range(0, 12, 2))
         return BLEDevice(mac, dev.name or "Chromecast Remote", dev)
 
+    async def _read_battery(self, client, chars, force=False):
+        """读遥控器电量（标准特征 0x2A19，挂在 180f 下）。
+
+        为什么值得加：180f 属于"半睡时也还在"的四个基础服务，所以**连语音都用不了的
+        时候也能读到电量**。于是"连不上"立刻分成两类完全不同的结论：
+          · 电量个位数 → 物理问题，换电池，别再折腾软件；
+          · 电量九十几 → 软件/服务快照问题，继续按三态日志定位。
+
+        ★ 全程吞异常：这是个诊断信息，**绝不能因为它把语音搞挂**。
+        """
+        if client is None:
+            return self.battery
+        now = time.time()
+        # 失败也算一次"尝试"：否则连不上时每 3 秒重连都会读一次 GATT。
+        if self._battery_at and (now - self._battery_at) < 20.0:
+            return self.battery
+        if not force and self._battery_at and (now - self._battery_at) < BATT_REFRESH:
+            return self.battery
+        self._battery_at = now
+        ch = None
+        for c in (chars or []):
+            if str(getattr(c, "uuid", "") or "").lower().startswith(BATT_LEVEL):
+                ch = c
+                break
+        if ch is None:
+            if not self._batt_warned:
+                self._batt_warned = True
+                self._log("语音：没找到标准电量特征（180f/2a19）—— 这台设备不报电量，跳过")
+            return self.battery
+        try:
+            raw = await client.read_gatt_char(ch)
+            pct = int(bytes(raw)[0])
+        except Exception as e:
+            if not self._batt_warned:
+                self._batt_warned = True
+                self._log(f"语音：读电量失败 {type(e).__name__}: {e}（不影响语音）")
+            return self.battery
+        if pct > 100:            # 0xFF 是标准里约定的"未知"
+            return self.battery
+        prev, self.battery = self.battery, pct
+        self._log(self._battery_line(pct, prev))
+        return pct
+
+    @staticmethod
+    def _battery_line(pct, prev=None):
+        """把电量翻成一句人话 —— 关键是让用户知道该换电池还是该看日志。"""
+        tail = ""
+        if prev is not None and pct < prev - 5:
+            tail = i18n.L(f"（上次 {prev}%，掉了 {prev - pct} 个百分点）",
+                          f" (was {prev}%, down {prev - pct})")
+        if pct <= 10:
+            return i18n.L(
+                f"语音：⚠ 遥控器电量只剩 {pct}%{tail} —— 电压一低它就会更早深睡，"
+                f"先换电池（1.5V 恒压锂电最好，碱性也行），这不是软件的问题",
+                f"Voice: battery is down to {pct}%{tail} — a low battery makes the remote "
+                f"deep-sleep much sooner; replace it (1.5V regulated lithium is best)")
+        if pct <= 20:
+            return i18n.L(
+                f"语音：遥控器电量 {pct}%{tail} —— 偏低了，2×1.2V 镍氢正好在这个区间"
+                f"最容易「按了没反应」，建议换碱性 / 1.5V 恒压锂电",
+                f"Voice: battery {pct}%{tail} — low; with 2×1.2V NiMH this is exactly the "
+                f"range where the remote stops answering; use alkaline / 1.5V lithium")
+        return i18n.L(f"语音：遥控器电量 {pct}%{tail}",
+                      f"Voice: remote battery {pct}%{tail}")
+
     async def _session(self):
         from bleak import BleakScanner
         from bleak.backends.device import BLEDevice
@@ -1549,6 +1629,14 @@ class VoiceRole(threading.Thread):
                 audio, status = find(ATVV_AUDIO), find(ATVV_STATUS)
                 ctl = find(ATVV_CTL)
 
+        # ★ 2026-11-10：读完服务表顺手读一次电量。放在 ATVV 判定**之前**，
+        #   这样"只剩 4 个基础服务"（180f 还在）也能拿到电量 —— 那正是最需要
+        #   知道"到底是不是电池的锅"的时刻。
+        try:
+            await self._read_battery(client, chars, force=True)
+        except Exception as _e:
+            self._log(f"语音：读电量出错 {type(_e).__name__}: {_e}（不影响语音）")
+
         if not (audio and status):
             self.misses += 1
             # ★ 计入"卡住"计数（2026-11-06 修正）：这条路径以前从不增加 _stuck，
@@ -1608,7 +1696,8 @@ class VoiceRole(threading.Thread):
         self._uncached_at = 0.0             # ★ 2026-11-09：成功一次就清零，下次"只剩 4 个"能立刻重发现
         self.connected = True
         self.note = i18n.L("已连接", "Connected")
-        self._emit("status", {"connected": True, "note": self.note})
+        self._emit("status", {"connected": True, "note": self.note,
+                              "battery": self.battery})
         if self.sink:
             self.sink.reset()
 
@@ -1679,6 +1768,12 @@ class VoiceRole(threading.Thread):
                     self._log("语音：连接已断开")
                     break
                 now = time.time()
+                # 每 10 分钟刷一次电量（_read_battery 自己节流，这里直接调即可）。
+                # 只读一个字节，不影响语音流。
+                try:
+                    await self._read_battery(client, chars)
+                except Exception:
+                    pass
                 if ctl is not None and now - keep_last[0] >= 8.0:
                     keep_last[0] = now
                     # ★★ 2026-11-09 第二次加固：心跳从 15 秒缩到 8 秒，
@@ -1919,6 +2014,8 @@ class VoiceWorkerRole(threading.Thread):
         self._connected = False
         self._ready = False
         self._note = i18n.L("未启动", "Not started")
+        # 遥控器电量（0~100 / None）。worker 通过 status 事件把它带过来。
+        self._battery = None
         # ★ app.py 的 state_snapshot() 会读 `v.voice.ok`（判断语音键能不能用）。
         #   只要接口还叫 "和 VoiceRole 完全一致"，就必须有同名的 voice 字段，
         #   否则主线程会在刷新状态时抛 AttributeError、整个客户端起不来。
@@ -1938,6 +2035,11 @@ class VoiceWorkerRole(threading.Thread):
     @property
     def note(self):
         return self._note
+
+    @property
+    def battery(self):
+        """遥控器电量（0~100），未知为 None。只读展示，不参与任何逻辑。"""
+        return self._battery
 
     @property
     def ready(self):
@@ -2092,6 +2194,9 @@ class VoiceWorkerRole(threading.Thread):
             p = obj.get("p") or {}
             self._connected = bool(p.get("connected"))
             self._note = p.get("note") or self._note
+            b = p.get("battery")
+            if isinstance(b, int) and 0 <= b <= 100:
+                self._battery = b
             try:
                 self.on_event("status", p)
             except Exception:
