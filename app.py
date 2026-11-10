@@ -3323,7 +3323,13 @@ def main():
         #      现在按命令行把本目录的实例全找出来一起结束。
         #   ② 端口被**别的程序**占着时不能杀 —— 那不是我们的客户端。说清楚再退出。
         procs = python_processes()
-        owners = set(port_owners(port))
+        # ★ 2026-11-10 小柯：PID 0 / 4 不是"另一个程序"。
+        #   真机 09:45:40 踩到：旧实例刚退出，netstat 里还留着一行
+        #       TCP 127.0.0.1:8787  0.0.0.0:0  LISTENING  0
+        #   （残留/系统保留端口的条目，没有真正的属主进程）。原来的判据把它当
+        #   "另一个程序占着端口"→ 新实例直接 return 3 退出，用户看到的是
+        #   "点重启之后客户端没了，要等开机自启看门狗 5 分钟后才回来"。
+        owners = {p for p in port_owners(port) if p not in (0, 4)}
         ours = set(our_instances(procs))
         # ★ 2026-11-10 小柯：**自己这一棵树（祖先 + 自己 + 子孙）一律不碰**。
         #   .venv 里的 pythonw.exe 是"转发器"：它自己带着 app.py 的命令行，再拉起一个
@@ -3351,13 +3357,22 @@ def main():
         foreign = owners - ours - keep
         if foreign:
             detail = "、".join(f"PID {p}" for p in sorted(foreign))
-            BUS.log(i18n.L(
-                f"界面端口 {port} 被**另一个程序**占着（{detail}），它不是本目录的客户端 —— "
-                f"我不会去杀它。先关掉它（或改 config.json 里的 ui_port）再启动。",
-                f"UI port {port} is held by **another program** ({detail}) that is not this "
-                f"folder's client — I will not kill it. Close it first (or change ui_port in "
-                f"config.json), then start again."))
-            return 3
+            if not already_running(port):
+                # 端口上其实没人应答 —— 说明那只是刚关闭的残留条目，不是"另一个程序"。
+                # 这种情况必须继续启动，否则用户点了重启就只能等看门狗兜底。
+                BUS.log(i18n.L(
+                    f"界面端口 {port} 在 netstat 里显示被 {detail} 占着，但它并不接受连接"
+                    f"（多半是刚关闭的残留条目）—— 继续启动。",
+                    f"UI port {port} shows {detail} in netstat but nothing accepts connections "
+                    f"there (a leftover entry) — starting anyway."))
+            else:
+                BUS.log(i18n.L(
+                    f"界面端口 {port} 被**另一个程序**占着（{detail}），它不是本目录的客户端 —— "
+                    f"我不会去杀它。先关掉它（或改 config.json 里的 ui_port）再启动。",
+                    f"UI port {port} is held by **another program** ({detail}) that is not this "
+                    f"folder's client — I will not kill it. Close it first (or change ui_port in "
+                    f"config.json), then start again."))
+                return 3
         old = sorted((ours | owners) - keep)
         if old:
             BUS.log(i18n.L(f"接管模式：结束 {len(old)} 个旧实例 {old}",
