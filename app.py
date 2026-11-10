@@ -107,7 +107,18 @@ DEFAULT_CONFIG = {
     "voice": {"mode": "hold", "key": "RALT", "mods": [],
               # ★ 2026-11-10：BLE 连接是否住进独立 worker 进程（voice_worker.py）。
               #   默认 false = 老行为（进程内线程），改 true 才启用 worker。
-              "worker": False},
+              "worker": False,
+              # ★ 2026-11-11：按键后自动恢复语音链路（"拿起来就用"）。
+              #   遥控器空闲后语音断了，按键报文（HID）还能到，但 BLE 语音链路没上。
+              #   按下语音键时若发现未连，自动运行恢复：先轻量重建语音链路（refresh，
+              #   等价于启动遥控器.vbs 的 --heal），不行再重启整个客户端（restart，
+              #   等价于运行「重启遥控器.bat"）。
+              "auto_heal_on_key": True,
+              # heal 的方式："refresh"=只重建语音链路 / "restart"=重启整个客户端 /
+              # "auto"=先 refresh，还未连再 restart
+              "heal_mode": "auto",
+              # 同一次按键爆发内只恢复一次的冷却秒，避免用户连续按键触发重复重启
+              "heal_cooldown": 30},
     "audio": {"gain": 4.0, "agc": True, "relay": True},
     "keys": RECOMMENDED,
 }
@@ -356,7 +367,11 @@ def save_config(cfg):
                       # ★ 2026-11-10：worker 开关同理 —— 不写进白名单，用户点一次
                       #   「保存」就把 voice.worker 抹掉，worker 静默退回进程内，
                       #   而进程内正是"只给 4 个服务"的病根。
-                      "worker": bool(v.get("worker", False))}
+                      "worker": bool(v.get("worker", False)),
+                      # ★ 2026-11-11：按键自动恢复（三项同理，必须进白名单）。
+                      "auto_heal_on_key": bool(v.get("auto_heal_on_key", True)),
+                      "heal_mode": str(v.get("heal_mode") or "auto"),
+                      "heal_cooldown": int(v.get("heal_cooldown") or 30)}
     # 语音键手势（升级功能）：长按 / 双击各配一个「点按」规格，字段形状同 voice 自己
     #   {"mode": "tap", "key": "F10", "mods": ["CTRL"]}
     # ★ 不在这里留位置，保存时会被白名单整段丢掉 —— 现象是"改完不生效，重开又回默认"，
@@ -1905,6 +1920,9 @@ class Roles:
         self.voice = None
         self.keytap = None
         self.lock = threading.Lock()
+        # ★ 2026-11-11：按键自动恢复的冷却时间戳（epoch秒），避免连续按键
+        #   触发重复重启/重建。
+        self._last_heal_at = 0.0
 
     def _on_event(self, kind, payload=None):
         if kind == "log":
@@ -1921,6 +1939,14 @@ class Roles:
                     spec = self.cfg.get("voice") or {}
                     how = "按一下" if spec.get("mode") == "tap" else "按住"
                     BUS.log(f"[按键] 语音 → {how} {spec.get('key')}")
+                    # ★ 2026-11-11：按键即自动恢复。空闲后语音BLE链路断了，但按键报文
+                    #   （HID）还能到——按下语音键时若发现未连，自动运行"那个批处理"：
+                    #   轻量重建语音链路（refresh，等价启动遥控器.vbs --heal），不行再
+                    #   重启整个客户端（restart，等价运行「重启遥控器.bat"）。
+                    v = self.voice
+                    connected = v is not None and getattr(v, "connected", False)
+                    if not connected:
+                        self._auto_heal_on_key()
                 else:
                     m = (self.cfg.get("keys") or {}).get(kid)
                     BUS.log(f"[按键] {label} → "
@@ -2048,6 +2074,63 @@ class Roles:
                 # 按键活动要叫醒的是**新的** voice，否则还指着旧对象
                 self.keytap.on_activity = self.voice.poke
         return True, i18n.L("语音已重建", "Voice refreshed")
+
+    def _auto_heal_on_key(self):
+        """按下语音键且语音未连时，自动运行恢复动作（轻→重）。
+
+        轻：refresh_voice() —— 只重建语音链路，不动按键映射、不重启进程
+            （等价于启动遥控器.vbs 的 --heal）。
+        重：launch_new_instance() —— 重启整个客户端，等价于运行
+            「重启遥控器.bat"。
+        带开关 + 冷却，避免用户连续按键触发重复重启/重建。
+        """
+        vcfg = self.cfg.get("voice") or {}
+        if not bool(vcfg.get("auto_heal_on_key", True)):
+            return
+        cooldown = int(vcfg.get("heal_cooldown") or 30)
+        now = time.time()
+        if now - self._last_heal_at < cooldown:
+            return
+        mode = str(vcfg.get("heal_mode") or "auto")
+        self._last_heal_at = now
+        BUS.log(i18n.L(
+            "语音键按下但语音未连，自动恢复（mode={0}）".format(mode),
+            "Voice key pressed but voice link down — auto-healing (mode={0})".format(mode)))
+
+        def _do_restart():
+            """重启整个客户端：拉起新实例，当前实例先停语音再退出。"""
+            try:
+                if ROLES:
+                    ROLES.stop(quiet=True)
+            except Exception:
+                pass
+            time.sleep(0.5)
+            os._exit(0)
+
+        ok = False
+        msg = ""
+        if mode == "refresh":
+            ok, msg = self.refresh_voice()
+        elif mode == "restart":
+            ok, exe = launch_new_instance()
+            msg = str(exe) if ok else exe
+            if ok:
+                # 新实例已拉起，当前实例让路退出（等价 restart-app 的 _bye）
+                threading.Thread(target=_do_restart, daemon=True).start()
+        else:  # auto：先轻量 refresh，不行再重启整个客户端
+            ok, msg = self.refresh_voice()
+            if not ok:
+                BUS.log(i18n.L("语音重建未成功，尝试重启整个客户端",
+                               "Voice refresh did not succeed, restarting whole client"))
+                ok, exe = launch_new_instance()
+                msg = str(exe) if ok else exe
+                if ok:
+                    threading.Thread(target=_do_restart, daemon=True).start()
+
+        if ok:
+            BUS.log(i18n.L("语音自动恢复已触发：{0}", "Voice auto-heal triggered: {0}").format(msg))
+        else:
+            BUS.log(i18n.L("语音自动恢复失败：{0}", "Voice auto-heal failed: {0}").format(msg))
 
     def watch_voice(self):
         """★ 语音看门狗 —— 完全在后端做，不依赖网页。
