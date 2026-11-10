@@ -50,7 +50,7 @@ if HERE not in sys.path:
 import i18n  # noqa: E402  （必须在 sys.path 之后就位）
 
 APP_NAME = "VibeMote"
-APP_VERSION = "1.1.0"          # 报 bug 时请带上这个版本号（界面「设置 → 界面」能看到）
+APP_VERSION = "1.2.0"          # 报 bug 时请带上这个版本号（界面「设置 → 界面」能看到）
 WEB = os.path.join(HERE, "web")
 CONFIG = os.path.join(HERE, "config.json")
 REQUIREMENTS = os.path.join(HERE, "requirements.txt")
@@ -99,7 +99,10 @@ DEFAULT_CONFIG = {
     "remote_addr": "",
     "ui_port": DEFAULT_PORT,
     "profile": {"app": "workbuddy", "ime": "qwen"},
-    "voice": {"mode": "hold", "key": "RALT", "mods": []},
+    "voice": {"mode": "hold", "key": "RALT", "mods": [],
+              # ★ 2026-11-10：BLE 连接是否住进独立 worker 进程（voice_worker.py）。
+              #   默认 false = 老行为（进程内线程），改 true 才启用 worker。
+              "worker": False},
     "audio": {"gain": 4.0, "agc": True, "relay": True},
     "keys": RECOMMENDED,
 }
@@ -344,7 +347,11 @@ def save_config(cfg):
                       #   服务），重连是白忙，还会反复把用户其它蓝牙设备断掉 ——
                       #   所以本机 config 里设为 false。必须写进白名单，否则用户在
                       #   界面点一次「保存」就会被抹回默认 True。
-                      "auto_unstick": bool(v.get("auto_unstick", True))}
+                      "auto_unstick": bool(v.get("auto_unstick", True)),
+                      # ★ 2026-11-10：worker 开关同理 —— 不写进白名单，用户点一次
+                      #   「保存」就把 voice.worker 抹掉，worker 静默退回进程内，
+                      #   而进程内正是"只给 4 个服务"的病根。
+                      "worker": bool(v.get("worker", False))}
     # 语音键手势（升级功能）：长按 / 双击各配一个「点按」规格，字段形状同 voice 自己
     #   {"mode": "tap", "key": "F10", "mods": ["CTRL"]}
     # ★ 不在这里留位置，保存时会被白名单整段丢掉 —— 现象是"改完不生效，重开又回默认"，
@@ -384,7 +391,10 @@ def save_config(cfg):
                 voice_alias = {"mode": "hold" if m["type"].startswith("hold") else "tap",
                                "key": m["value"],
                                "mods": [str(x).upper() for x in (m.get("mods") or [])],
-                               "auto_unstick": bool(v.get("auto_unstick", True))}
+                               "auto_unstick": bool(v.get("auto_unstick", True)),
+                               # ★ 2026-11-10：这条分支会**整个替换** clean["voice"]，
+                               #   漏了 worker 就等于"在按键映射页改一次语音键 → worker 被关掉"。
+                               "worker": bool(v.get("worker", False))}
             continue
         keys_map[k] = {"type": m["type"], "value": m["value"],
                        "mods": [str(x).upper() for x in (m.get("mods") or [])],
@@ -1752,6 +1762,30 @@ def set_autostart(on, on_line=None):
 
 
 # ============================================================ 角色管理
+def make_voice(cfg, on_event):
+    """按配置决定语音角色住在哪里 —— 本进程线程，还是独立短命进程。
+
+    ★ 2026-11-10：BLE 连接搬进独立 worker 进程（`voice.worker: true`）。
+      为什么：Windows 的 WinRT 设备对象一建起来，它内部的 GATT 服务快照就冻住了；
+      进程内 close 句柄 / 重建对象 / 换 UNCACHED 重新发现都拿不回 ATVV，只有
+      换进程才行（小柯的对照实验：同一秒，本进程 28 次全是 4 个服务，独立进程 8 个）。
+      worker 发现"连上了但连续 20 秒（或累计 3 次）只有 4 个服务"就自己退出，这里换一个
+      新进程，语音随即恢复 —— 对用户就是"断了会自己回来，不用点重启"。
+
+    ★ 默认关（`voice.worker` 缺省 false）：保持原来的进程内行为，随时可一键回退。
+      两个实现在 app.py 眼里接口完全一致（start/stop/poke/is_alive/connected/note/
+      ready/set_addr/set_voice_spec），所以下面各处调用都不用改。
+    """
+    import voice as voice_mod
+    spec = cfg.get("voice") or {}
+    kw = dict(addr=cfg.get("remote_addr"), audio=cfg.get("audio"),
+              voice_spec=cfg.get("voice"),
+              relay=bool((cfg.get("audio") or {}).get("relay", True)))
+    if bool(spec.get("worker", False)):
+        return voice_mod.VoiceWorkerRole(on_event, **kw)
+    return voice_mod.VoiceRole(on_event, **kw)
+
+
 class Roles:
     """把语音和按键两个角色装在本进程的线程里，并提供启动/停止/重启。"""
 
@@ -1802,11 +1836,7 @@ class Roles:
         self._ensure_qwen_flag()
         with self.lock:
             if self.voice is None:
-                import voice as voice_mod
-                self.voice = voice_mod.VoiceRole(
-                    self._on_event, addr=self.cfg.get("remote_addr"),
-                    audio=self.cfg.get("audio"), voice_spec=self.cfg.get("voice"),
-                    relay=bool((self.cfg.get("audio") or {}).get("relay", True)))
+                self.voice = make_voice(self.cfg, self._on_event)
                 self.voice.start()
             if self.keytap is None and importlib.util.find_spec("frida") is not None:
                 import keys as keys_mod
@@ -1901,11 +1931,7 @@ class Roles:
             except Exception:
                 pass
         with self.lock:
-            import voice as voice_mod
-            self.voice = voice_mod.VoiceRole(
-                self._on_event, addr=self.cfg.get("remote_addr"),
-                audio=self.cfg.get("audio"), voice_spec=self.cfg.get("voice"),
-                relay=bool((self.cfg.get("audio") or {}).get("relay", True)))
+            self.voice = make_voice(self.cfg, self._on_event)
             self.voice.start()
             if self.keytap is not None:
                 # 按键活动要叫醒的是**新的** voice，否则还指着旧对象
@@ -3001,8 +3027,20 @@ class Handler(BaseHTTPRequestHandler):
                 f"正在重启客户端（用 {os.path.basename(exe)} 拉起新实例）…",
                 f"Restarting the client (launching a new instance with "
                 f"{os.path.basename(exe)})…"))
-            threading.Thread(target=lambda: (time.sleep(2.5), os._exit(0)),
-                             daemon=True).start()
+            def _bye():
+                time.sleep(2.5)
+                # ★ 2026-11-10 小柯：退出前把语音 worker 停干净。
+                #   worker 手里的 GATT 如果是被硬杀掉的，遥控器会认为"还有客户端在"，
+                #   新实例连上去又只剩 1800/1801/180a/180f 四个基础服务 —— 正好是
+                #   我们花一整天在治的那个病。所以宁可多等这 3 秒。
+                try:
+                    if ROLES:
+                        ROLES.stop(quiet=True)
+                except Exception:
+                    pass
+                os._exit(0)
+
+            threading.Thread(target=_bye, daemon=True).start()
             return self._json({"ok": True, "msg": i18n.L(
                 "正在重启，约 5 秒后刷新本页面",
                 "Restarting — refresh this page in about 5 seconds")})
@@ -3246,7 +3284,15 @@ def main():
     # 弹了也没人点，还会变成每次开机都弹一次（用户完全不知道是谁要权限）。
     ap.add_argument("--boot", action="store_true",
                     help="由开机自启拉起（不主动弹任何提权框）")
+    # --voice-worker：本进程就是"语音 worker"（只有打包成单 exe 时才会走到这里；
+    # 正常装法下 worker 是独立的 voice_worker.py 脚本，不经过 app.py）。
+    ap.add_argument("--voice-worker", dest="voice_worker", action="store_true",
+                    help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    if args.voice_worker:
+        import voice_worker
+        return voice_worker.main()
 
     if args.selftest:
         return _selftest()
@@ -3279,7 +3325,30 @@ def main():
         procs = python_processes()
         owners = set(port_owners(port))
         ours = set(our_instances(procs))
-        foreign = owners - ours
+        # ★ 2026-11-10 小柯：**自己这一棵树（祖先 + 自己 + 子孙）一律不碰**。
+        #   .venv 里的 pythonw.exe 是"转发器"：它自己带着 app.py 的命令行，再拉起一个
+        #   真正的解释器子进程 —— 两者都满足 our_instances() 的判据，而且
+        #   restart-app 用 ShellExecuteW 拉起的新实例，父进程链上就挂着**旧实例**。
+        #   原来只排除 os.getpid()，真机连踩两坑：
+        #     · 09:14:07 结束 [5124, 18368, 30952]，30952 是新实例自己的子进程；
+        #     · 09:17:14 结束 [17972, 18180, 32152]，32152 是拉起新实例的旧实例（祖先），
+        #       把它杀掉连带把新实例一起带走 —— 用户看到"点重启之后整个客户端没了"。
+        #   旧实例不需要我们杀：restart-app 那条路它自己会退出（见 _bye）。
+        by_pid = {pid: ppid for pid, ppid, _c in procs}
+        keep = {os.getpid()}
+        cur = os.getppid()
+        while cur and cur not in keep:          # 祖先链（转发器 / 拉起我们的旧实例）
+            keep.add(cur)
+            cur = by_pid.get(cur, 0)
+        changed = True
+        while changed:                          # 子孙树
+            changed = False
+            for pid, ppid, _c in procs:
+                if pid not in keep and ppid in keep:
+                    keep.add(pid)
+                    changed = True
+        ours -= keep
+        foreign = owners - ours - keep
         if foreign:
             detail = "、".join(f"PID {p}" for p in sorted(foreign))
             BUS.log(i18n.L(
@@ -3289,7 +3358,7 @@ def main():
                 f"folder's client — I will not kill it. Close it first (or change ui_port in "
                 f"config.json), then start again."))
             return 3
-        old = sorted(ours | owners)
+        old = sorted((ours | owners) - keep)
         if old:
             BUS.log(i18n.L(f"接管模式：结束 {len(old)} 个旧实例 {old}",
                            f"Takeover: stopping {len(old)} old instance(s) {old}"))
@@ -3303,9 +3372,11 @@ def main():
                     pass
             for _ in range(80):                 # 最多等 20 秒
                 time.sleep(0.25)
-                if not already_running(port) and not our_instances():
+                # ★ 判据也要减掉自己这一棵树：转发器父进程永远在 our_instances() 里，
+                #   不减的话每次接管都要白等满 20 秒才开始启动。
+                if not already_running(port) and not (set(our_instances()) - keep):
                     break
-            left = our_instances()
+            left = sorted(set(our_instances()) - keep)
             if left:
                 BUS.log(i18n.L(
                     f"还有 {len(left)} 个旧实例没能结束（{left}）—— 先继续启动，"

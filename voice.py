@@ -1874,3 +1874,366 @@ class VoiceRole(threading.Thread):
             except Exception:
                 pass
         self.connected = False
+
+
+# ============================================================ 语音 worker 监督者
+class VoiceWorkerRole(threading.Thread):
+    """把 BLE 连接交给一个**短命 worker 进程**，本类只做监督（2026-11-10）。
+
+    ★ 为什么必须跨进程：Windows 的 WinRT 设备对象一旦建起来，它内部的 GATT
+      服务快照就冻住了 —— 进程内 close 句柄 / 重建 BluetoothLEDevice / 换
+      UNCACHED 重新发现，拿回来的还是 1800/1801/180a/180f 四个基础服务。
+      小柯的对照实验：同一秒，App 进程内 28 次全是 4 个，另起独立进程直接问
+      系统，CACHED/UNCACHED 都是 8 个。只有进程边界能重置这份快照。
+
+    ★ 对外接口与 VoiceRole **完全一致**（start/stop/poke/is_alive/connected/
+      note/ready/set_addr/set_voice_spec），所以 app.py 只换构造那一行。
+
+    ★ 回收节流（防止把"自愈"又变成"重启风暴"）：
+       · worker 报"连续 20 秒 / 累计 3 次只有 4 个服务"→ 这是快照过期，**立刻换新进程**
+         （等 1.5 秒再起，让 Windows 把旧 GATT 句柄还给系统）；
+       · 用户按下遥控器按键时，若 worker 已经见过 ≥2 次 4 服务却还没连上 → worker 立刻
+         退出换进程（按键那一刻是遥控器唯一醒着的窗口，留在坏进程里只会错过）；
+       · 若 60 秒内又因同样原因退出 → 说明不是快照问题（设备真的半睡），
+         退避 60 → 120 → 300 秒，不再连续折腾（这期间按键可以立刻打断退避）；
+       · 设备真睡（压根连不上）时 worker **不会**退出，本类也不会重建。
+    """
+
+    def __init__(self, on_event, addr=ADDR_DEFAULT, audio=None, voice_spec=None,
+                 relay=True):
+        super().__init__(daemon=True, name="VoiceWorkerRole")
+        self.on_event = on_event
+        self._addr = (addr or "").strip()
+        self._audio = dict(audio or {})
+        self._voice_spec = voice_spec or {"mode": "hold", "key": "RALT", "mods": []}
+        self._relay = bool(relay)
+        self._halt = threading.Event()
+        # ★ 2026-11-10 小柯：按键叫醒用的"打断退避"事件。
+        #   原来回收失败后要退避 60/120/300 秒，这期间 poke() 只是往 stdin 写一行
+        #   （进程根本不在，写了个寂寞）—— 用户按键的**唯一**唤醒窗口就这么被错过，
+        #   表现还是"按了没反应"。现在 poke() 同时置位这个事件，run() 的退避等待
+        #   每 0.2 秒看一眼，一置位就立刻重建进程。
+        self._poke_evt = threading.Event()
+        self._lock = threading.Lock()
+        self._proc = None
+        self._connected = False
+        self._ready = False
+        self._note = i18n.L("未启动", "Not started")
+        # ★ app.py 的 state_snapshot() 会读 `v.voice.ok`（判断语音键能不能用）。
+        #   只要接口还叫 "和 VoiceRole 完全一致"，就必须有同名的 voice 字段，
+        #   否则主线程会在刷新状态时抛 AttributeError、整个客户端起不来。
+        self.voice = VoiceKey(self._voice_spec)
+        self._recycles = 0                # 连续"4 个服务"回收的次数（用于退避）
+        self._last_recycle_at = 0.0
+        self._child_pid = 0
+        self._last_why = ""
+        self.sessions = 0
+        self.frames = 0
+
+    # ---------- 对外接口（与 VoiceRole 同名同义） ----------
+    @property
+    def connected(self):
+        return self._connected
+
+    @property
+    def note(self):
+        return self._note
+
+    @property
+    def ready(self):
+        """至少起过一个 worker 进程、并且它报过 ready —— 看门狗据此决定要不要催。"""
+        return self._ready
+
+    def poke(self):
+        """遥控器刚有按键活动：转发给 worker，让它**立刻**重试连接。
+
+        为什么必须转发而不是本进程自己连：本进程根本不持有 BLE 连接。
+        按键是唯一能叫醒遥控器的通道（HID 报文走系统蓝牙栈），所以这条链路
+        必须通 —— 通了就是"按一下就好"。
+        """
+        # 先置位：万一 worker 进程不在（正在退避），监督者要能被打断、立刻重建。
+        self._poke_evt.set()
+        self._send({"c": "poke"})
+
+    def set_addr(self, addr):
+        new = (addr or "").strip()
+        if new == self._addr:
+            return False
+        self._addr = new
+        self._send({"c": "addr", "v": new})
+        return True
+
+    def set_voice_spec(self, spec):
+        if not spec:
+            return
+        self._voice_spec = spec
+        try:
+            self.voice = VoiceKey(spec)
+        except Exception:
+            pass
+        self._send({"c": "spec", "v": spec})
+
+    def stop(self, join_timeout=3.0):
+        """停 worker：先礼后兵 —— 发 stop 让它自己断开 GATT，等 3 秒，再强杀。
+
+        为什么不直接 kill：worker 手里的 BleakClient 如果不 disconnect 就死掉，
+        遥控器会认为"还有客户端在"，下一次连接又只剩 4 个基础服务 —— 那就正好
+        制造了我们想消灭的那个故障。
+        """
+        self._halt.set()
+        p = self._proc
+        if p is not None and p.poll() is None:
+            self._send({"c": "stop"})
+            for _ in range(max(1, int(join_timeout / 0.1))):
+                if p.poll() is not None:
+                    break
+                time.sleep(0.1)
+            if p.poll() is None:
+                # ★ 2026-11-10 小柯：必须**连子进程一起杀**（taskkill /T）。
+                #   .venv 的 python.exe 是"转发器"：真正的 worker 是它的子进程。
+                #   只 terminate() 转发器会留下一个孤儿 worker —— 它还握着 BLE 连接，
+                #   遥控器就会把下一条连接当"第二个客户端"，只给 4 个基础服务，
+                #   正好是我们花一整天在治的那个病。
+                killed = False
+                try:
+                    import subprocess
+                    subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)],
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                                   timeout=10)
+                    killed = True
+                except Exception:
+                    pass
+                if not killed:
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+                # 兜底：worker 自己报过 pid（真进程），转发器那层杀不到就直接杀它
+                child = int(self._child_pid or 0)
+                if child and child != p.pid:
+                    try:
+                        import subprocess
+                        subprocess.run(["taskkill", "/F", "/PID", str(child)],
+                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                                       timeout=10)
+                    except Exception:
+                        pass
+        if self.is_alive() and threading.current_thread() is not self:
+            self.join(join_timeout)
+        self._connected = False
+
+    # ---------- 内部 ----------
+    def _send(self, obj):
+        p = self._proc
+        if p is None or p.poll() is not None:
+            return False
+        try:
+            import json
+            # ensure_ascii=True：中文一律走 \uXXXX 转义。worker 的 stdin 在 Windows
+            # 下默认是 cp936，直接送 UTF-8 中文会被解坏；纯 ASCII 则永不踩编码。
+            p.stdin.write((json.dumps(obj, ensure_ascii=True) + "\n").encode("utf-8"))
+            p.stdin.flush()
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _python_exe():
+        """选一个**带 console 流**的解释器。
+
+        ★ 关键：pythonw.exe 不分配标准流，sys.stdin 可能是 None —— 那样 worker
+          收不到 poke，退化成"只能等退避"。所以这里优先用同目录的 python.exe。
+        """
+        import os
+        import sys
+        exe = sys.executable or ""
+        if exe.lower().endswith("pythonw.exe"):
+            cand = os.path.join(os.path.dirname(exe), "python.exe")
+            if os.path.exists(cand):
+                return cand
+        return exe
+
+    def _spawn_args(self):
+        """worker 进程的命令行。★ 名字不能叫 _args —— threading.Thread 内部
+        有个同名字段（保存 target 的位置参数），会把方法整个盖掉。"""
+        import base64
+        import json
+        import os
+        cfg = {"addr": self._addr, "audio": self._audio, "voice": self._voice_spec,
+               "relay": self._relay}
+        blob = base64.b64encode(json.dumps(cfg, ensure_ascii=False).encode("utf-8")).decode("ascii")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice_worker.py")
+        if not os.path.exists(script):
+            # 打包成单个 exe 时没有独立的 voice_worker.py 文件 —— 用同一个 exe 的
+            # `--voice-worker` 分支当 worker（app.py 的 main() 第一件事就是它）。
+            import sys
+            return [sys.executable, "--voice-worker", "--cfg", blob]
+        return [self._python_exe(), script, "--cfg", blob]
+
+    def _log(self, msg):
+        try:
+            self.on_event("log", msg)
+        except Exception:
+            pass
+
+    def _handle(self, obj):
+        t = obj.get("t")
+        if t == "log":
+            self._log(str(obj.get("m") or ""))
+        elif t == "key":
+            p = obj.get("p") or {}
+            if p.get("down"):
+                self.sessions += 1
+            try:
+                self.on_event("key", p)
+            except Exception:
+                pass
+        elif t == "status":
+            p = obj.get("p") or {}
+            self._connected = bool(p.get("connected"))
+            self._note = p.get("note") or self._note
+            try:
+                self.on_event("status", p)
+            except Exception:
+                pass
+        elif t == "ready":
+            self._ready = True
+            self._child_pid = int(obj.get("pid") or 0)
+        elif t == "exit":
+            self._last_why = str(obj.get("why") or "")
+
+    def run(self):
+        import collections
+        import json
+        import os
+        import subprocess
+
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        err_tail = collections.deque(maxlen=40)
+
+        # ★ 强制子进程用 UTF-8 标准流（PYTHONUTF8 + PYTHONIOENCODING）。
+        #   中文机器默认走 cp936，管道里一混编码，界面上就会冒出"就绪◆◆◆"。
+        #   worker 自己也会 reconfigure 一遍，这里是双保险。
+        child_env = dict(os.environ)
+        child_env["PYTHONUTF8"] = "1"
+        child_env["PYTHONIOENCODING"] = "utf-8"
+
+        while not self._halt.is_set():
+            try:
+                proc = subprocess.Popen(
+                    self._spawn_args(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, creationflags=flags, close_fds=True,
+                    env=child_env)
+            except Exception as e:
+                self._log(i18n.L(f"语音worker：启动失败 {type(e).__name__}: {e} —— 3 秒后重试",
+                                 f"Voice worker: failed to start {type(e).__name__}: {e} — "
+                                 f"retrying in 3s"))
+                self._halt.wait(3.0)
+                continue
+
+            self._proc = proc
+            self._connected = False
+            self._last_why = ""
+            # 新进程已经起来了，之前攒下的 poke 就作废 —— 否则会白跳过下一次退避。
+            self._poke_evt.clear()
+            self._log(i18n.L(f"语音worker：已启动（pid {proc.pid}）—— BLE 连接住在这个独立进程里，"
+                             f"服务快照过期时换新进程即可自动恢复",
+                             f"Voice worker: started (pid {proc.pid}) — the BLE link lives in this "
+                             f"separate process, so a stale service snapshot is reset by a new one"))
+
+            def read_out(p=proc):
+                for raw in iter(p.stdout.readline, b""):
+                    s = raw.decode("utf-8", "replace").strip()
+                    if not s:
+                        continue
+                    try:
+                        obj = json.loads(s)
+                    except Exception:
+                        continue
+                    try:
+                        self._handle(obj)
+                    except Exception:
+                        pass
+
+            def read_err(p=proc):
+                for raw in iter(p.stderr.readline, b""):
+                    s = raw.decode("utf-8", "replace").strip()
+                    if s:
+                        err_tail.append(s)
+
+            t1 = threading.Thread(target=read_out, daemon=True, name="worker-out")
+            t2 = threading.Thread(target=read_err, daemon=True, name="worker-err")
+            t1.start()
+            t2.start()
+
+            rc = proc.wait()
+            self._proc = None
+            self._connected = False
+            self._ready = False
+            t1.join(1.0)
+            t2.join(1.0)
+
+            if self._halt.is_set():
+                break
+
+            # 把 worker 的 stderr 尾巴写进日志：import 失败、依赖缺失这类问题
+            # 否则是"静默退出"，用户只会看到"语音没了"。
+            if err_tail:
+                for line in list(err_tail)[-6:]:
+                    self._log(f"语音worker(stderr)：{line}")
+                err_tail.clear()
+
+            four_recycle = ("只有 4 个" in self._last_why) or (rc == 3)
+            now = time.time()
+            if four_recycle:
+                if now - self._last_recycle_at < 60.0:
+                    self._recycles += 1          # 连续：不是快照问题，退避
+                else:
+                    self._recycles = 1           # 这一轮第一次：立刻重建
+                self._last_recycle_at = now
+                if self._recycles <= 1:
+                    # ★ 2026-11-10 小柯：0.5 秒太急 —— 旧进程刚退出，Windows 还没把
+                    #   GATT 句柄还给系统，新进程连上去常常只拿到 6 个服务（实测
+                    #   09:23:26 就是 6 个：1800/1801/180a/180f/ae40/d343bfc0）。
+                    #   等 1.5 秒再起，一次拿到完整 8 个的概率高得多。
+                    delay = 1.5
+                    self._log(i18n.L(
+                        f"语音worker：{self._last_why} —— 换一个新进程重置服务快照"
+                        f"（这就是「断了自己回来」，不需要任何人去点重启）",
+                        f"Voice worker: {self._last_why} — spawning a fresh process to reset the "
+                        f"service snapshot (this is the automatic recovery; nobody has to click "
+                        f"restart)"))
+                else:
+                    delay = min(60.0 * (2 ** (self._recycles - 2)), 300.0)
+                    self._log(i18n.L(
+                        f"语音worker：换进程也没拿回 ATVV（{self._last_why}）—— 说明这次不是快照过期，"
+                        f"多半是遥控器半睡。退避 {delay:.0f} 秒再试；这期间按一下遥控器任意键会立刻重试。",
+                        f"Voice worker: a fresh process still got no ATVV ({self._last_why}) — so this "
+                        f"is not a stale snapshot but the remote half-asleep. Backing off {delay:.0f}s; "
+                        f"pressing any remote key retries immediately."))
+            else:
+                # 不是"4 个服务"导致的退出（崩溃 / 依赖问题 / 主动 stop）
+                self._recycles = 0
+                delay = 3.0
+                self._log(i18n.L(
+                    f"语音worker：进程退出（code {rc}{'，' + self._last_why if self._last_why else ''}）"
+                    f"—— {delay:.0f} 秒后重启",
+                    f"Voice worker: process exited (code {rc}"
+                    f"{', ' + self._last_why if self._last_why else ''}) — restarting in {delay:.0f}s"))
+
+            # 退避等待必须**可被按键打断**：用户按下遥控器的那一刻就是遥控器醒着
+            # 的唯一窗口，等满 60/120/300 秒再重连等于又错过一次。
+            deadline = time.time() + delay
+            woke_by_key = False
+            while not self._halt.is_set() and time.time() < deadline:
+                if self._poke_evt.wait(0.2):
+                    self._poke_evt.clear()
+                    woke_by_key = True
+                    break
+            if self._halt.is_set():
+                break
+            if woke_by_key:
+                self._log(i18n.L(
+                    "语音worker：遥控器有按键活动 —— 打断退避，立刻重建连接进程",
+                    "Voice worker: remote key activity — cutting the backoff short and "
+                    "respawn immediately"))
