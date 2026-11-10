@@ -78,6 +78,9 @@ before = MarkerStamp()
 ' really answers, so a failed start can never look like "nothing happened".
 cmd = """" & py & """ """ & base & "\app.py"" --silent"
 If boot Then cmd = cmd & " --boot"
+' 双击（非 --silent）：请求已有实例重建语音链路（"拿起来就用"）。
+' 若没实例在跑，app.py 会忽略 --heal 并正常启动一份新的。
+If Not silent Then cmd = cmd & " --heal"
 If port > 0 Then cmd = cmd & " --port " & port
 
 On Error Resume Next

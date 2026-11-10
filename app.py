@@ -50,7 +50,7 @@ if HERE not in sys.path:
 import i18n  # noqa: E402  （必须在 sys.path 之后就位）
 
 APP_NAME = "VibeMote"
-APP_VERSION = "1.2.2"          # 报 bug 时请带上这个版本号（界面「设置 → 界面」能看到）
+APP_VERSION = "1.2.3"          # 报 bug 时请带上这个版本号（界面「设置 → 界面」能看到）
 WEB = os.path.join(HERE, "web")
 CONFIG = os.path.join(HERE, "config.json")
 REQUIREMENTS = os.path.join(HERE, "requirements.txt")
@@ -1873,6 +1873,30 @@ def clear_recovery_state():
         pass
 
 
+def ask_heal(port):
+    """向已运行的实例发 {"action":"heal"}：只重建语音链路，不动按键映射、
+    不重启进程。用于启动遥控器.vbs 的 --heal 入口（"拿起来就用"）。
+    返回 (ok, msg)。"""
+    import urllib.request
+    import urllib.error
+    data = json.dumps({"action": "heal"}).encode("utf-8")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/action",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            if r.status == 200:
+                return True, i18n.L("语音链路已重建", "Voice link refreshed")
+            return False, i18n.L("实例返回状态 {0}", "Instance returned status {0}").format(r.status)
+    except urllib.error.URLError as e:
+        return False, i18n.L("实例未应答：{0}", "Instance did not answer: {0}").format(e)
+    except Exception as e:
+        return False, i18n.L("发送 heal 失败：{0}", "Send heal failed: {0}").format(e)
+
+
 class Roles:
     """把语音和按键两个角色装在本进程的线程里，并提供启动/停止/重启。"""
 
@@ -2110,7 +2134,10 @@ class Roles:
                 else:
                     miss = 0
                 # 3) 阶梯 ②：换进程也没用 → 重启整个客户端
-                respawns = int(getattr(v, "respawns", 0) or 0)
+                #    只看"4 个基础服务"（快照过期）换进程的次数：纯"连不上"（设备
+                #    半睡/无广播）换进程不计入，否则设备真睡时会反复换进程、甚至
+                #    误触重启客户端——用户最反感的"反复启停"。
+                respawns = int(getattr(v, "snapshot_respawns", 0) or 0)
                 since_last = (now - last_esc) if last_esc else 1e9
                 down = now - down_since
                 if watch_escalate(down, respawns, esc_count, since_last):
@@ -2119,9 +2146,9 @@ class Roles:
                     write_recovery_state(esc_count + 1, now)
                     ok = self._auto_restart_self(i18n.L(
                         f"语音通道已经连续 {down:.0f} 秒连不上，"
-                        f"期间换过 {respawns} 次 worker 进程都没救回来",
+                        f"期间快照过期换过 {respawns} 次 worker 进程仍没救回来",
                         f"the voice link has been down for {down:.0f}s and "
-                        f"{respawns} worker respawns did not help"))
+                        f"{respawns} snapshot-based worker respawns did not help"))
                     if ok:
                         return
                     esc_count += 1
@@ -3003,6 +3030,11 @@ class Handler(BaseHTTPRequestHandler):
         if act == "start":
             ok, msg = ROLES.start()
             return self._json({"ok": ok, "msg": msg})
+        if act == "heal":
+            # 启动遥控器.vbs 双击入口："拿起来就用"——只重建语音链路，
+            # 不动按键映射、不重启进程。
+            ok, msg = self.refresh_voice()
+            return self._json({"ok": ok, "msg": msg})
         if act == "stop":
             ok, msg = ROLES.stop()
             return self._json({"ok": ok, "msg": msg})
@@ -3478,6 +3510,11 @@ def main():
     # 弹了也没人点，还会变成每次开机都弹一次（用户完全不知道是谁要权限）。
     ap.add_argument("--boot", action="store_true",
                     help="由开机自启拉起（不主动弹任何提权框）")
+    # --heal：启动遥控器.vbs 双击时追加；若已有实例在跑，就向它发
+    # {"action":"heal"}，只重建语音链路（refresh_voice），不动按键映射、
+    # 不重启进程——"拿起来就用"的快捷方式入口。
+    ap.add_argument("--heal", action="store_true",
+                    help=argparse.SUPPRESS)
     # --voice-worker：本进程就是"语音 worker"（只有打包成单 exe 时才会走到这里；
     # 正常装法下 worker 是独立的 voice_worker.py 脚本，不经过 app.py）。
     ap.add_argument("--voice-worker", dest="voice_worker", action="store_true",
@@ -3497,6 +3534,16 @@ def main():
     i18n.load_from_config()
     port = args.port or int(cfg.get("ui_port") or DEFAULT_PORT)
     url = f"http://127.0.0.1:{port}/"
+
+    if args.heal:
+        # 双击启动器而非 --silent：若已有实例在跑，就向它发 heal（只重建语音链路），
+        # 然后退出；若没实例在跑，继续正常启动一份新的。
+        if already_running(port):
+            ok, msg = ask_heal(port)
+            BUS.log(i18n.L(
+                f"快捷方式请求 heal：{msg}" if ok else f"快捷方式 heal 失败：{msg}",
+                f"Shortcut requested heal: {msg}" if ok else f"Shortcut heal failed: {msg}"))
+            return 0 if ok else 2
 
     if already_running(port) and not args.takeover:
         if not args.silent:

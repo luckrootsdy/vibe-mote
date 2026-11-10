@@ -864,6 +864,19 @@ class VoiceRole(threading.Thread):
         self.frames = 0
         self.misses = 0
         self._session_frames = 0
+        # ★★ 2026-11-10 小柯：「假连」标记（真机 13:51 实锤，这就是用户说的
+        #    "按遥控器怎么按也起不来"）。
+        #    遥控器会「连着但不送音频」：按住语音键，ATVV 的 0x04 开始通知照常收到、
+        #    手势照常发出去，可音频流一个字节都没有 —— 而 8 秒保活心跳还一路成功，
+        #    于是程序以为自己健康，用户按到手酸也没反应。真机证据：
+        #      13:51:03~13:51:21 连续 8 次会话，7 次是 **0 帧**（最长 1.3s）
+        #      心跳直到 13:52:16 才报 Not connected（晚了 55 秒）
+        #      重连之后第一次会话就 711 帧 ≈ 11.4s，完全正常
+        #    也就是说：救它只要"把这条连接丢掉重连"，代价约 1 秒；不救就得等 55 秒
+        #    以上，而且这期间用户会以为遥控器坏了。
+        self._reconnect_now = False         # 下一轮不要退避，立刻重连
+        self._zero_frame_sessions = 0       # 一共撞到几次「假连」（诊断用）
+        self._session_t0 = 0.0              # 本次会话开始时刻（判「太短不算」）
         self._active = False
         self._cable_warned = False
         self._relay_warned = False
@@ -1361,6 +1374,12 @@ class VoiceRole(threading.Thread):
                 if fails >= 8 and fails % 8 == 0:
                     self._log(f"语音：已连续 {fails} 次没连上，退避到 {delay:.0f} 秒；"
                               f"若一直这样，按住遥控器语音键 1 秒即可（软件侧叫不醒它）")
+            # ★★ 2026-11-10 小柯：「假连」不退避，立刻重连（约 1 秒）。
+            #   由 _on_status 的 0 帧分支置位（见本文件 ~1955 行）；心跳循环里也会
+            #   看到它并提前 break，到这里时 delay 就会被压到 1 秒。
+            if getattr(self, "_reconnect_now", False):
+                self._reconnect_now = False
+                delay = 1.0
             # 等退避，但遥控器一有按键活动就立刻重试（那会儿它刚醒，成功率最高）
             end = time.time() + delay
             while (time.time() < end and not self.stop_flag.is_set()
@@ -1795,6 +1814,14 @@ class VoiceRole(threading.Thread):
                 if not client.is_connected:
                     self._log("语音：连接已断开")
                     break
+                # ★★ 2026-11-10 小柯：「假连」立刻重连（真机 13:51 实锤）。
+                #   刚才那段会话一个音频帧都没有（0x04 收到了、手势发了、音频没动），
+                #   但心跳还在成功——说明连接本身是僵尸。不要等 8 秒心跳超时，立刻
+                #   把本条会话结束，让 _loop_sessions 立刻重连（约 1 秒）。
+                if getattr(self, "_reconnect_now", False):
+                    self._reconnect_now = False
+                    self._log("语音：检测到「假连」—— 提前结束本次会话，立刻重连")
+                    break
                 now = time.time()
                 # 每 10 分钟刷一次电量（_read_battery 自己节流，这里直接调即可）。
                 # 只读一个字节，不影响语音流。
@@ -1898,6 +1925,7 @@ class VoiceRole(threading.Thread):
             self._active = True
             self.sessions += 1
             self._session_frames = 0
+            self._session_t0 = time.monotonic()
             self._emit("key", {"id": "voice", "down": True})
             self._log(f"语音：▼ 开始（第 {self.sessions} 次会话）")
             if not self._gesture:
@@ -1936,8 +1964,20 @@ class VoiceRole(threading.Thread):
                     self._last_tap = time.monotonic()
                     self._on_short_tap()
             n = self._session_frames
+            dur = time.monotonic() - (self._session_t0 or time.monotonic())
             self._log(f"语音：▲ 结束（本段 {n} 帧音频 ≈ {n / 62.5:.1f}s）")
-            if n < 20:
+            if n == 0 and dur >= 0.4:
+                # ★ 按了这么久、一个音频帧都没有 → 这条连接是「假连」（见 __init__）。
+                #   立刻标脏，主循环马上断开重连（约 1 秒），不用用户再按一次。
+                #   `dur >= 0.4` 是防止"极短的一下轻碰"被误判成假连。
+                self._zero_frame_sessions += 1
+                self._reconnect_now = True
+                self._log(i18n.L(
+                    "语音：这段一个音频帧都没有 —— 这条连接是「假连」，立刻重连"
+                    "（不用你再按一次；按键映射不受影响）",
+                    "Voice: no audio frame at all this time — the link is a zombie; "
+                    "reconnecting right now (no need to press again)"))
+            elif n < 20:
                 # 按键通了、但遥控器没送音频 —— 这是另一类问题（没真正进录音态），
                 # 跟「语音键读不到」完全不是一回事，日志里必须分开说。
                 self._log("语音：⚠ 音频帧太少 —— 遥控器没在送音频（多半没真正进录音态）")
@@ -2054,6 +2094,8 @@ class VoiceWorkerRole(threading.Thread):
         # 一旦真的连上就清零（见 _handle 的 status 分支）。
         self._cf_level = 0
         self._respawns = 0                # 一共换过多少次 worker 进程（app 看门狗用它判阶梯）
+        self._snapshot_respawns = 0       # 其中因为"只有 4 个基础服务"（快照过期）换进程的次数
+                                          # —— app.py 阶梯②只看这个：连续 ≥2 次换不动才重启整个客户端
         self._poke_reason = "key"         # 最近一次 poke 是谁发的：key / watchdog
         self._last_recycle_at = 0.0
         self._child_pid = 0
@@ -2088,6 +2130,15 @@ class VoiceWorkerRole(threading.Thread):
         连续换 2 次还是连不上，才值得动"重启整个客户端"那一步。
         """
         return self._respawns
+
+    @property
+    def snapshot_respawns(self):
+        """因为"只有 4 个基础服务"（快照过期）而换进程的次数。
+
+        app.py 阶梯②用它（而非总 respawns）：连续换进程 ≥2 次仍拿不回 ATVV，
+        才说明换进程这招用尽，值得重启整个客户端。
+        """
+        return self._snapshot_respawns
 
     def poke(self, reason="key"):
         """遥控器刚有按键活动：转发给 worker，让它**立刻**重试连接。
@@ -2360,6 +2411,8 @@ class VoiceWorkerRole(threading.Thread):
                     f"Voice worker: {self._last_why} — spawning a fresh process to grab the "
                     f"link (attempt {self._cf_level}, in {delay:.0f}s)"))
             elif four_recycle:
+                # 只有"4 个基础服务"（快照过期）才算：阶梯②依据此决定是否重启整个客户端
+                self._snapshot_respawns += 1
                 if now - self._last_recycle_at < 60.0:
                     self._recycles += 1          # 连续：不是快照问题，退避
                 else:
