@@ -171,10 +171,10 @@ class InstallerApp:
         self.content = tk.Frame(self.root)
         self.content.pack(fill="both", expand=True, padx=24, pady=16)
 
+        self._build_bottom()          # 先创建底部按钮，再显示首页（首页引用 btn_back）
         self._stage = 0
         self._install_dir = self._default_install_dir()
         self._show_welcome()
-        self._build_bottom()
 
     def _default_install_dir(self):
         pf = os.environ.get("PROGRAMFILES", r"C:\Program Files")
