@@ -120,7 +120,12 @@ DEFAULT_CONFIG = {
               # 最能保证"拿起来就用"。
               "heal_mode": "restart",
               # 同一次按键爆发内只恢复一次的冷却秒，避免用户连续按键触发重复重启
-              "heal_cooldown": 30},
+              "heal_cooldown": 30,
+              # ★ 2026-11-12：松开遥控器语音键后，「按住说话」的键最多再按住多少毫秒
+              #   （补收还在管道里没到的结尾音频）。判据是"还有没有新音频帧在到"，
+              #   音频本来就停了就立刻抬键，所以正常情况下没有额外延迟。
+              #   0 = 关掉这个行为（退回"松开立刻抬键"）。
+              "tail_ms": 1500},
     "audio": {"gain": 4.0, "agc": True, "relay": True},
     "keys": RECOMMENDED,
 }
@@ -373,7 +378,12 @@ def save_config(cfg):
                       # ★ 2026-11-11：按键自动恢复（三项同理，必须进白名单）。
                       "auto_heal_on_key": bool(v.get("auto_heal_on_key", True)),
                       "heal_mode": str(v.get("heal_mode") or "restart"),
-                      "heal_cooldown": int(v.get("heal_cooldown") or 30)}
+                      "heal_cooldown": int(v.get("heal_cooldown") or 30),
+                      # ★ 2026-11-12：松开后补录上限（见 voice.py 的 VOICE_TAIL_*）。
+                      #   必须进白名单，否则用户点一次「保存」就被抹回默认。
+                      "tail_ms": (int(v["tail_ms"])
+                                  if isinstance(v.get("tail_ms"), (int, float))
+                                  else 1500)}
     # 语音键手势（升级功能）：长按 / 双击各配一个「点按」规格，字段形状同 voice 自己
     #   {"mode": "tap", "key": "F10", "mods": ["CTRL"]}
     # ★ 不在这里留位置，保存时会被白名单整段丢掉 —— 现象是"改完不生效，重开又回默认"，

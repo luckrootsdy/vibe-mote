@@ -50,6 +50,18 @@ VOICE_LONG_MS = 200       # 按住超过这么久 → 判「长按」= 按住说
 VOICE_DOUBLE_MS = 200     # 第一下松开后这么快之内再按一下 → 判「双击」
 VOICE_TAP_DELAY_MS = 200  # 短按松开后等这么久确认不是双击，才发「单击」
 
+# ★ 2026-11-12：松开遥控器语音键后，「按住说话」的那个键**不要立刻抬**。
+#   真机统计（安装版 14:55–16:47，50 段会话）发现：日志里收到的音频时长比
+#   「按住时长」平均少 1.4 秒（0.6~4.4s）—— 也就是用户说完松手时，最后一段
+#   声音还在管道里没到。遥控器一松开就发 0x00（停），这时候如果马上抬
+#   Ctrl+Win，输入法立刻停录 → 管道里剩下的音频直接丢掉，表现就是"结尾被吃掉"。
+#   所以：松开后先别抬，只要还有音频帧在陆续到达就继续按住，等它们进完再抬。
+#   · 连续 VOICE_TAIL_IDLE_MS 没有新帧 → 抬（正常情况下音频本来就停了，等于没延迟）
+#   · 最多再按住 VOICE_TAIL_MAX_MS → 兜底，绝不把输入法面板挂在那儿
+#   配置项 `voice.tail_ms` 可覆盖上限（0 = 关掉这个行为，退回"松开立刻抬"）。
+VOICE_TAIL_IDLE_MS = 250    # 松开后：连续这么久没有新音频帧 → 抬键
+VOICE_TAIL_MAX_MS = 1500    # 松开后最多再按住这么久（= voice.tail_ms 的默认值）
+
 
 def probe_mic(seconds=1.0):
     """读一秒**系统默认输入设备**，报出峰值 —— 给"声音输入不进去"这类问题定性。
@@ -877,6 +889,12 @@ class VoiceRole(threading.Thread):
         self._reconnect_now = False         # 下一轮不要退避，立刻重连
         self._zero_frame_sessions = 0       # 一共撞到几次「假连」（诊断用）
         self._session_t0 = 0.0              # 本次会话开始时刻（判「太短不算」）
+        # ★ 2026-11-12：首帧 / 末帧时刻（monotonic）。真机统计发现「音频时长比按住
+        #   时长少约 1.4 秒」，但日志只有总时长，分不清少在**开头**（遥控器麦克风
+        #   起振慢）还是**结尾**（松开就把流掐了）。这两个字段就是为了把这 1.4 秒
+        #   拆开，别再靠猜：会话结束那行会打出「首帧 +Nms / 末帧距松开 Nms」。
+        self._first_frame_at = 0.0
+        self._last_frame_at = 0.0
         self._active = False
         self._cable_warned = False
         self._relay_warned = False
@@ -912,6 +930,14 @@ class VoiceRole(threading.Thread):
         self._long_fired = False      # 这一轮是否已经判成长按（已经在说话）
         self._tap_timer = None        # 单击延迟计时器（等双击窗口过去）
         self._suppress = False        # 这一轮按下被判定为双击的第二下 → 什么都不做
+        # ★ 2026-11-12：松开后"补录"用（见文件头 VOICE_TAIL_* 注释）
+        self._tail_timer = None       # 正在补录时的线程；None = 没在补录
+        self._tail_frames0 = 0        # 补录开始时的帧计数（统计多收了几帧）
+        self._tail_t0 = 0.0           # 补录开始时刻（算实际等了多久）
+        try:
+            self._tail_ms = max(0, int(self.voice_spec.get("tail_ms", VOICE_TAIL_MAX_MS)))
+        except Exception:
+            self._tail_ms = VOICE_TAIL_MAX_MS
 
     # ---------- 对外 ----------
     def poke(self, reason="key"):
@@ -1020,6 +1046,11 @@ class VoiceRole(threading.Thread):
         self._long_key = VoiceKey(self.voice_spec.get("long") or _default_gesture)
         self._double_key = VoiceKey(self._double_spec)
         self._tap_key = VoiceKey(self._tap_spec)
+        # ★ 2026-11-12：改配置后「松开补录」的上限也立刻生效，不用重启客户端
+        try:
+            self._tail_ms = max(0, int(self.voice_spec.get("tail_ms", VOICE_TAIL_MAX_MS)))
+        except Exception:
+            self._tail_ms = VOICE_TAIL_MAX_MS
 
     # ---------- 线程主体 ----------
     def run(self):
@@ -1061,6 +1092,7 @@ class VoiceRole(threading.Thread):
             if self.sink:
                 self.sink.stop()
                 self.sink = None
+            self._cancel_tail()
             self.voice.release()
 
     async def _audio_supervisor(self):
@@ -1744,6 +1776,11 @@ class VoiceRole(threading.Thread):
             self.frames += 1
             self._session_frames += 1
             last_frame[0] = time.time()
+            # ★ 2026-11-12：首帧/末帧时刻，供会话结束那行把「少掉的 1.4 秒」拆开
+            now_m = time.monotonic()
+            if not self._first_frame_at:
+                self._first_frame_at = now_m
+            self._last_frame_at = now_m
             if self.sink:
                 try:
                     self.sink.feed_adpcm(bytes(data))
@@ -1860,6 +1897,7 @@ class VoiceRole(threading.Thread):
         finally:
             self.connected = False
             self.note = i18n.L("已断开", "Disconnected")
+            self._cancel_tail()
             self.voice.release()
             await self._close_current()
 
@@ -1918,14 +1956,81 @@ class VoiceRole(threading.Thread):
         self._tap_timer = t
         t.start()
 
+    # ---------- 松开后的「补录」（见文件头 VOICE_TAIL_* 注释） ----------
+    def _cancel_tail(self):
+        """取消正在进行的补录（用户又按下 / 线程要退出时调用）。"""
+        t = self._tail_timer
+        self._tail_timer = None
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+    def _release_with_tail(self):
+        """结束「按住说话」：默认立刻抬键；开着补录就先等管道里剩下的音频进完。
+
+        为什么不能只按"固定延时"做：真机上 1.4 秒的缺口可能出现在**开头**
+        （麦克风起振慢，那部分声音根本不存在，等多久也没用）也可能出现在
+        **结尾**（还在管道里传）。用"最后一帧音频到了多久"来判：
+          · 松开时已经 1.4 秒没有新帧 → 管道是空的，立刻抬键（零代价）
+          · 松开后还有帧陆续到 → 继续按住，直到它们停 VOICE_TAIL_IDLE_MS
+        上限 `voice.tail_ms` 兜底，绝不会把输入法面板挂在那儿。
+        """
+        self._cancel_tail()
+        if self._tail_ms <= 0:
+            self.voice.release()
+            return
+        frames0 = self._session_frames
+        t0 = time.monotonic()
+
+        def _worker():
+            while not self.stop_flag.is_set():
+                time.sleep(0.05)
+                now = time.monotonic()
+                last = self._last_frame_at or 0.0
+                idle_ms = (now - last) * 1000.0 if last else 1e9
+                if idle_ms >= VOICE_TAIL_IDLE_MS or (now - t0) * 1000.0 >= self._tail_ms:
+                    break
+            extra = self._session_frames - frames0
+            # 出口还有待播缓冲（约 200ms）：抬键前先让它流干净，否则最后这 200ms
+            # 会被输入法"停录"挡在虚拟声卡里 —— 白补。
+            # ★ 判据是「不足一个播放块（20ms）」而不是「空」：Sink 每帧只产出
+            #   1920 字节、而播放块是 3840 字节，缓冲区永远会剩 1920 字节不被
+            #   取走 —— 用 ">0" 判的话每次都撞满 350ms 上限（实测每次都等 422ms）。
+            sink = self.sink
+            if sink is not None:
+                one_block = int(SR_OUT * 0.02) * 4
+                drain_t0 = time.monotonic()
+                while ((time.monotonic() - drain_t0) < 0.35
+                       and len(getattr(sink, "buf", b"")) >= one_block):
+                    time.sleep(0.02)
+            waited = (time.monotonic() - t0) * 1000.0
+            self.voice.release()
+            if extra > 0:
+                self._log(f"语音：松开后又等了 {waited:.0f}ms，补收 {extra} 帧"
+                          f"（≈ {extra / 62.5:.2f}s 结尾音频）")
+            elif waited >= 300:
+                # 等了这么久一帧都没补到 → 缺口不在"管道里还没到"，而是遥控器
+                # 根本没把这段送出来（麦克风起振慢 / 松开就停编码）。记一笔，别再猜。
+                self._log(f"语音：松开后等了 {waited:.0f}ms，没补到帧"
+                          f"（结尾缺的那段遥控器没送出来，不是被我们掐掉的）")
+
+        t = threading.Thread(target=_worker, daemon=True, name="VoiceTail")
+        self._tail_timer = t
+        t.start()
+
     # ---------- 语音键事件 ----------
     def _on_status(self, b: bytes):
         active = getattr(self, "_active", False)
         if b[0] == 0x04 and not active:
+            self._cancel_tail()                 # 又按下了：上一轮的补录到此为止
             self._active = True
             self.sessions += 1
             self._session_frames = 0
             self._session_t0 = time.monotonic()
+            self._first_frame_at = 0.0
+            self._last_frame_at = 0.0
             self._emit("key", {"id": "voice", "down": True})
             self._log(f"语音：▼ 开始（第 {self.sessions} 次会话）")
             if not self._gesture:
@@ -1950,14 +2055,14 @@ class VoiceRole(threading.Thread):
             self._active = False
             self._emit("key", {"id": "voice", "down": False})
             if not self._gesture:
-                self.voice.release()
+                self._release_with_tail()
             else:
                 self._disarm_long()
                 if self._suppress:
                     self._suppress = False              # 双击的第二下：什么都不做
                 elif self._long_fired:
                     self._long_fired = False
-                    self.voice.release()                # 按住说话结束
+                    self._release_with_tail()           # 按住说话结束（松开后补录）
                     self._last_tap = 0.0
                 else:
                     # 短按：记下时间，等双击窗口过去；没第二下就发单击
@@ -1965,7 +2070,17 @@ class VoiceRole(threading.Thread):
                     self._on_short_tap()
             n = self._session_frames
             dur = time.monotonic() - (self._session_t0 or time.monotonic())
-            self._log(f"语音：▲ 结束（本段 {n} 帧音频 ≈ {n / 62.5:.1f}s）")
+            # ★ 2026-11-12：把「音频比按住短」拆成开头/结尾两段（ms）。
+            #   head = 按下 → 第一帧音频；tail = 最后一帧音频 → 松开。
+            #   两个都大 = 两头都在丢；head 大 tail 小 = 遥控器麦克风起振慢（只能等）；
+            #   head 小 tail 大 = 松开就掐流（可以在松开后多按住一会儿补回来）。
+            if self._first_frame_at and self._last_frame_at:
+                head_ms = (self._first_frame_at - (self._session_t0 or self._first_frame_at)) * 1000.0
+                tail_ms = (time.monotonic() - self._last_frame_at) * 1000.0
+                timing = f"首帧 +{head_ms:.0f}ms，末帧距松开 {tail_ms:.0f}ms"
+            else:
+                timing = "首帧 无（这段没音频）"
+            self._log(f"语音：▲ 结束（本段 {n} 帧音频 ≈ {n / 62.5:.1f}s；{timing}）")
             if n == 0 and dur >= 0.4:
                 # ★ 按了这么久、一个音频帧都没有 → 这条连接是「假连」（见 __init__）。
                 #   立刻标脏，主循环马上断开重连（约 1 秒），不用用户再按一次。
@@ -2004,6 +2119,7 @@ class VoiceRole(threading.Thread):
           → join 线程。调用方（重启/重建）可以安全地接着 new 新的 VoiceRole。
         """
         self.stop_flag.set()
+        self._cancel_tail()
         self.voice.release()
         loop = getattr(self, "_loop", None)
         if loop is not None:
