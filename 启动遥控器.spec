@@ -35,4 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['D:/01 AI/AI_RemoteMic/vibe-mote-new/vibe-mote-main_Win64_Setup/newtop_official2.ico'],
 )
