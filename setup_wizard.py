@@ -159,6 +159,11 @@ def dir_size(path):
 # ---------------------------------------------------------------------------
 SKIP_DIRS = {".git", "build", "dist", "__pycache__", ".venv",
              "_upgrade_backup_20261105"}
+# ⚠ `build` / `dist` 是通用名，会**误伤**第三方包里的同名子目录：
+#   实测 payload 目录 771 个文件、清单只有 727 个，差的 44 个 =
+#   34 个 `.pyc` + 2 个 `.github/*.yml` + 8 个 `pip\_internal\operations\build\*.py`。
+#   目前无害（pip 只是随 runtime 带的诊断工具，离线版不装包），
+#   但**别**以为"清单少了就是 bug"。
 SKIP_NAMES = {
     "client.log",
     "client.log.20261109_pre_fix",
