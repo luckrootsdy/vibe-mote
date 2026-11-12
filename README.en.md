@@ -94,7 +94,7 @@ and mappings can be exported / imported.
 
 | Package | Version | Purpose |
 |---|---|---|
-| `frida` | ≥17.18 <18 | **Required for key mapping** (~130MB): injects into the Bluetooth driver host to read HID reports. Installed into the bundled `.venv`, exits as soon as it is done |
+| `frida` | ≥17.18 <17.25 | **Required for key mapping** (~130MB): injects into the Bluetooth driver host to read HID reports. Installed into the bundled `.venv`, exits as soon as it is done |
 
 > **Everything works fine without frida** — the voice button uses the ATVV channel and does not depend on it. Only the D-pad/OK mappings are unavailable.
 > Installing frida triggers one UAC prompt on first attach (Frida installs a helper for itself); after running this project's "one-click optimization",
@@ -295,7 +295,7 @@ cleanup ticks **nothing by default**: only what you tick gets removed.
   keyboards/mice. We only rewrite the reports of the mapped keys, but if that host ever crashed your Bluetooth
   input would drop with it (never seen in practice; if it happens, restart the client or re-plug the adapter).
 - **Undocumented interfaces**: key mapping relies on an **undocumented IOCTL** of the Windows Bluetooth HID
-  driver and one registry path, and pins `frida >=17.18,<18`. A Windows or frida update can silently break it —
+  driver and one registry path, and pins `frida >=17.18,<17.25`. A Windows or frida update can silently break it —
   it degrades gracefully: voice keeps working, key mapping is disabled and the log says so.
 - **Antivirus false positives**: frida's module names (`frida-agent.dll`, `frida-helper-*.exe`) are in several
   vendors' signature sets. The offline bundle is ~61MB, ~47MB of which is frida — if your AV silently quarantines
