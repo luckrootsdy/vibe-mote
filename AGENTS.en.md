@@ -17,14 +17,33 @@ The program starts a web console on `127.0.0.1:8787` (localhost only).
 1. Is the system **Windows 10/11 x64**?
 2. Is the remote a **Google TV / Chromecast Bluetooth remote** (other remotes use different report formats)?
 3. Which package will be used?
-   - `vibe-mote-offline-v1.zip` (~61MB, **bundles Python, recommended**) → nothing to install
+   - **`VibeMote_Setup.exe` (installer, ~203MB of data, easiest on a clean machine ← recommended)**:
+     bundles the Python runtime (`runtime\`) **and** the official virtual-audio-cable files, so the target
+     machine needs **no Python and no network**
+   - `vibe-mote-offline-v1.zip` (~61MB, bundles Python) → unzip and run, but you install the cable yourself
    - `vibe-mote-v1.zip` (~900KB) → requires **Python 3.10+**; have the user install it from
      [python.org](https://www.python.org/downloads/), **be sure to check `Add python.exe to PATH`**,
      and do not use the Microsoft Store version
 
 ## 1. Installation
 
-**Offline bundle**: unzip → double-click `启动遥控器.vbs` → done (no other steps).
+**Installer `VibeMote_Setup.exe` (recommended)**: double-click → click Next through the wizard → finish → **reboot once**.
+
+| What the wizard does | What you must tell the user |
+|---|---|
+| Installs to `C:\Program Files\VibeMote 遥控器` (**one UAC prompt**, because writing to Program Files and installing an audio driver both need admin) | Click "Yes" on the UAC prompt — it is not the app grabbing privileges for no reason |
+| Step 3 **launches VB-CABLE's own installer** (the bundle carries the 6 official Pack45 files, not one byte changed) | In that window **click Install Driver** and accept its licence; **you must reboot afterwards** (VB-Audio's requirement) — without the reboot voice will seem to have "no sound" |
+| Creates Desktop / Start-menu shortcuts + an uninstall entry | The uninstall entry points at the bundled `runtime\pythonw.exe`, so no Python install is needed |
+
+After installation, **on first launch go to Settings and click "Scan for remote"** — the package
+**contains no Bluetooth address**; `config.json` ships with `remote_addr` empty.
+
+> Why shipping only `.venv` does not work: a venv is just a shell. Its `pyvenv.cfg` points at the
+> `C:\Python312` of the machine that created it, so on a clean machine it exits with code 103
+> (see pits 22/23 in `01_踩坑与经验_总纲.md`). The wizard installs `runtime\`
+> (official embeddable 3.12.9) instead, and `sys.prefix` is that directory itself.
+
+**Offline bundle**: unzip → double-click `启动遥控器.vbs` → done (no other steps; install the cable from the UI checklist).
 
 **Light package** (when the target machine has Python):
 
@@ -70,11 +89,16 @@ foreach ($m in $mirrors) {
 
 ```powershell
 # 2.1 Launch (same as double-clicking 启动遥控器.vbs; --silent means don't open a browser)
-.venv\Scripts\pythonw.exe app.py --silent
-
+#     Installer build: use the bundled runtime; offline bundle / dev folder: runtime first, .venv as fallback
+.\runtime\pythonw.exe app.py --silent
 # 2.2 Wait 5 seconds, then ask the API for status
 Invoke-RestMethod http://127.0.0.1:8787/api/state | ConvertTo-Json -Depth 5
 ```
+
+> To prove it truly does not depend on the system Python, run this in the install directory:
+> `.\runtime\python.exe -c "import sys;print(sys.prefix, sys.base_prefix)"` —
+> both should be the `runtime` folder inside the install directory, and `sys.path` must contain
+> **no** `C:\Python*` entries.
 
 Reading `/api/state`:
 
@@ -133,9 +157,10 @@ run as a resident administrator — this project does not need it and doing so c
 "Settings → Cleanup / Uninstall" in the UI is a **per-item checklist** (nothing is checked by default); the command line works too:
 
 ```powershell
-.venv\Scripts\python.exe uninstall.py --items=venv,pycache   # delete only these two
-.venv\Scripts\python.exe uninstall.py --items=all            # delete everything (including config)
-.venv\Scripts\python.exe uninstall.py --dry-run              # list only, change nothing
+.\runtime\python.exe uninstall.py --items=venv,pycache      # delete only these two
+.\runtime\python.exe uninstall.py --items=all               # delete everything (including config)
+.\runtime\python.exe uninstall.py --dry-run                 # list only, change nothing
+# In old packages / a dev folder without runtime\, replace .\runtime\python.exe with .venv\Scripts\python.exe
 ```
 
 Available ids: `task, run, kill, frida_helper, frida_svc, venv, pycache, pythontxt, logs, config, qwen, cable`.
@@ -153,12 +178,16 @@ The bundled `runtime\` is part of the program itself and is not in the cleanup l
 
 ## 6. Environment
 
-Windows 10/11 x64 · Python 3.10 or newer · voice requires the VB-CABLE virtual audio cable
+Windows 10/11 x64 · **the installer / offline bundle bundles Python 3.12.9** (only the light package
+needs Python 3.10+ on the system) · voice requires the VB-CABLE virtual audio cable
 (its own installer needs administrator rights once; unrelated to this program).
 
-**How to install VB-CABLE**: both zips ship the official installer **and its driver files**, so have
-the user click the **one-click install** button on the home-page checklist row (or on the
-"Settings → Virtual audio cable" card). Two things to tell them up front:
+**How to install VB-CABLE**:
+- **Installer `VibeMote_Setup.exe`**: step 3 of the wizard **launches VB-CABLE's own installer for you**;
+- **Offline bundle / light package**: have the user click the **one-click install** button on the
+  home-page checklist row (or on the "Settings → Virtual audio cable" card).
+
+Two things to tell them up front:
 - one UAC prompt appears (that is the audio driver installer's own requirement, unrelated to this
   program), and they still have to click **"Install Driver" in its own window** — the official
   installer **offers no silent-install switch** (no `-i` / `-s` / `/S`), so this step cannot be automated;

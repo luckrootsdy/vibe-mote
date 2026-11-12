@@ -260,7 +260,15 @@ Function PickPy()
     On Error GoTo 0
   End If
 
-  ' 1) package-local virtualenv (created by the "install dependencies" button).
+  ' 1) a python runtime shipped next to the app (offline install / USB layout).
+  '    ★ This MUST come before .venv: .venv is only a shell (pyvenv.cfg points at
+  '    C:\Python312), so on a machine without that Python it dies with
+  '    "No Python at 'C:\Python312\pythonw.exe'" and double-click does nothing.
+  '    runtime\ is a real embeddable interpreter whose prefix is itself.
+  p = base & "\runtime\pythonw.exe"
+  If fso.FileExists(p) Then PickPy = p : Exit Function
+
+  ' 2) package-local virtualenv (created by the "install dependencies" button).
   '    It must be a COMPLETE venv. A half-deleted .venv still has
   '    Scripts\pythonw.exe lying around but cannot run anything, and picking it
   '    makes double-click do absolutely nothing (no window, no error, no browser)
@@ -273,10 +281,6 @@ Function PickPy()
       PickPy = p : Exit Function
     End If
   End If
-
-  ' 2) a python runtime shipped next to the app (offline / USB layout)
-  p = base & "\runtime\pythonw.exe"
-  If fso.FileExists(p) Then PickPy = p : Exit Function
 
   ' 3) common per-user and machine-wide installations
   cands = Array( _

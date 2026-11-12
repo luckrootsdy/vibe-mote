@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""VibeMote 遥控器启动器（EXE 版，可固定到任务栏）。
+r"""VibeMote 遥控器启动器（EXE 版，可固定到任务栏）。
 
 替代 启动遥控器.vbs。纯 Python，用 PyInstaller --onefile --windowed 打包：
 * 无黑控制台窗口；
-* 找本地 pythonw（优先程序目录 .venv\Scripts\pythonw.exe）；
+* 找本地 pythonw（**优先程序目录 runtime\pythonw.exe**，其次 .venv\Scripts\pythonw.exe）；
 * 启动 app.py --silent --heal（已有实例则只发 heal，不动按键映射、不重启进程）；
 * 等待就绪（最多 25 秒）后打开浏览器；失败则弹中文提示框并指向 client.log。
 """
@@ -24,10 +24,21 @@ def resource_dir():
 
 
 def find_pythonw(base):
-    """优先本地 .venv，其次系统常见路径，最后 PATH 上的 pythonw.exe。"""
+    r"""找该用来跑 app.py 的 pythonw.exe。
+
+    ★ 顺序是 **runtime\ 优先，.venv 其次**（2026-11-12 改的，别调回去）。
+
+    为什么不能沿用"`.venv` 优先"：`.venv` **不是自带 Python**，它只是壳 ——
+    `pyvenv.cfg` 里 `home = C:\\Python312`，标准库和 `python312.dll` 都在系统 Python
+    那边。装到一台没装过 Python 的电脑上，它只会回一句
+    `No Python at 'C:\\Python312\\pythonw.exe'`（退出码 103），用户看到的是"双击没反应"。
+
+    `runtime\\` 是官方 embeddable 发行版 + 复制进来的 site-packages，prefix 就是自己，
+    拷到任何机器上都能跑。开发机上两者都有（.venv 是给开发用的），必须让 runtime 赢。
+    """
     cands = [
-        os.path.join(base, ".venv", "Scripts", "pythonw.exe"),
         os.path.join(base, "runtime", "pythonw.exe"),
+        os.path.join(base, ".venv", "Scripts", "pythonw.exe"),
         os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python313\pythonw.exe"),
         os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python312\pythonw.exe"),
         os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python311\pythonw.exe"),
@@ -100,9 +111,10 @@ def main():
     py = find_pythonw(base)
     if not py:
         msgbox(
-            "未找到 pythonw.exe。请确认已安装 Python 3.10+ 并勾选“Add python.exe to PATH”，\n"
-            "或在程序目录放一个完整的 .venv。",
-            "VibeMote - 未找到 Python", 0x10)
+            "未找到 pythonw.exe —— 程序自带的运行时（runtime\\）不见了，\n"
+            "安装包可能没装完整或被安全软件删掉了。\n\n"
+            "修法：重新运行 VibeMote 安装程序（选同一个目录，会补回缺失文件）。",
+            "VibeMote - 运行时缺失", 0x10)
         return 1
 
     port = read_port(base)

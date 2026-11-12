@@ -1,5 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
-
+# VibeMote 启动器（启动遥控器.exe）
+# 打包：C:\Python312\python.exe -m PyInstaller --clean --noconfirm 启动遥控器.spec
+#   （--distpath / --workpath 指到 D:\TEMP\opencode 下，别把 build/ dist/ 留在项目里）
 
 a = Analysis(
     ['start_remote.py'],
@@ -36,4 +38,6 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['D:/01 AI/AI_RemoteMic/vibe-mote-new/vibe-mote-main_Win64_Setup/newtop_official2.ico'],
+    # PE 版本信息：不挂这个，文件属性里"版本/产品名/公司"全是空的（2026-11-12 实测全空）
+    version='D:/01 AI/AI_RemoteMic/vibe-mote-new/vibe-mote-main/version_launcher.txt',
 )

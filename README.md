@@ -9,7 +9,9 @@
 **下载 → 解压 → 双击 `启动遥控器.vbs`**，没有第四步（离线包自带 Python，目标机器不需要装任何东西）。
 
 > ⬇️ **[下载最新版](releases/latest)**
-> · `vibe-mote-offline-v1.zip`（约 61MB，**自带 Python + 完整功能**，解压就能跑 ← 推荐）
+> · `VibeMote_Setup.exe`（**安装向导，约 203MB 数据**：自带 Python 运行时 + 虚拟声卡原文件，
+>   干净电脑双击装完就能用 ← **最省事，推荐**）
+> · `vibe-mote-offline-v1.zip`（约 61MB，**自带 Python + 完整功能**，解压就能跑）
 > · `vibe-mote-offline-voice-v1.zip`（约 14MB，**只语音、不含 frida** ← 怕杀软 / 公司电脑选它）
 > · `vibe-mote-v1.zip`（约 900KB，目标机器已装 Python 3.10+ 时用）
 > 更新日志 → [`CHANGELOG.md`](CHANGELOG.md) ·
@@ -174,15 +176,31 @@ python -m pip download -r requirements-keys.txt -d wheels    :: 可选，约 130
 
 | 组成 | 大小 | 说明 |
 |---|---|---|
-| Python 3.13 官方 **embeddable** 包 | 10.4MB | 官方专门为"塞进应用里直接跑"提供的发行版 |
-| bleak / sounddevice / cffi / winrt-* | 约 5MB | 语音必需 |
-| frida | 47.3MB | 按键映射必需（这是包体的大头） |
+| Python **3.12.9** 官方 **embeddable** 包 | 约 15MB（解压后） | 官方专门为"塞进应用里直接跑"提供的发行版；`sys.prefix` 就是 `runtime\` 自己，不依赖目标机任何 Python |
+| bleak / sounddevice / cffi / winrt-* | 约 12MB | 语音必需 |
+| frida | 157.9MB（压缩后约 47MB） | 按键映射必需（这是包体的大头） |
 
 > 界面上那两个「安装依赖」按钮在离线包上会直接告诉你"依赖已内置、不用装"。
 
 > 📌 **内置的 `runtime\` 属于程序本体，清理工具不会删它。**
 > 因为界面上的「全部安装」装的是 pip 包，**装不回**一个 Python 发行版 ——
 > 删了就再也回不到"免安装"状态了。所以清理清单里干脆不提供这个选项。
+
+### 路线 E：安装向导 `VibeMote_Setup.exe`（干净电脑最省事）
+
+跟路线 D 同一套自包含运行时，但多做了三件事：
+
+| 步骤 | 向导做的事 |
+|---|---|
+| 1 | 装到 `C:\Program Files\VibeMote 遥控器`（一次 UAC 全解决） |
+| 2 | **拉起 VB-CABLE 官方安装器**（包里带着官网 6 个原文件，一字节未改；用户自己点 Install Driver） |
+| 3 | 建桌面 / 开始菜单快捷方式 + 卸载入口（卸载入口指向包内 `runtime\pythonw.exe`） |
+
+装完提示两件事：**重启一次电脑**（虚拟声卡要重启才生效）、
+**首次启动去设置里「扫描遥控器」**（安装包里没有预置任何蓝牙地址）。
+
+> 卸载：开始菜单 →「卸载 VibeMote」，或 设置 → 应用 → 卸载。
+> **`runtime\` 不会被卸载工具删**（同上，删了就没法免安装运行了）；要彻底清干净就整个删安装目录。
 
 ---
 
