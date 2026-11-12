@@ -50,7 +50,7 @@ if HERE not in sys.path:
 import i18n  # noqa: E402  （必须在 sys.path 之后就位）
 
 APP_NAME = "VibeMote"
-APP_VERSION = "1.2.3"          # 报 bug 时请带上这个版本号（界面「设置 → 界面」能看到）
+APP_VERSION = "1.3.0"          # 报 bug 时请带上这个版本号（界面「设置 → 界面」能看到）
 WEB = os.path.join(HERE, "web")
 CONFIG = os.path.join(HERE, "config.json")
 REQUIREMENTS = os.path.join(HERE, "requirements.txt")
@@ -770,16 +770,16 @@ def _install(on_line, req):
         on_line(i18n.L(f"找不到 {req}", f"{req} not found"))
         return 1
     if is_bundled_runtime():
-        # 到这儿说明内置运行时里确实缺东西（正常情况不会）。嵌入式包没法就地 pip 安装，
-        # 所以别硬试，直接给一条用户能走通的路。
-        on_line(i18n.L("这是「离线全量包」：依赖内置在 runtime\\ 里，不能再往里面装。",
-                       "This is the offline full bundle: the dependencies are built into "
-                       "runtime\\ and nothing can be added to it."))
-        on_line(i18n.L("修法：换用带联网安装的轻包（vibe-mote-v1.zip），"
-                       "或者重新解压一份离线包（可能被误删了文件）。",
-                       "Fix: switch to the light package with online installation "
-                       "(vibe-mote-v1.zip), or unpack the offline bundle again "
-                       "(files may have been deleted by accident)."))
+        # 到这儿说明内置运行时里确实缺东西（正常情况不会）。
+        # 内置 runtime 是只读性质的"程序本体"（装在 Program Files，写它要管理员），
+        # 而且官方 embeddable 包本来就不该就地 pip 安装 —— 别硬试，给一条能走通的路。
+        on_line(i18n.L("这是「离线安装版」：依赖内置在 runtime\\ 里，不在这里现装。",
+                       "This is the offline install: the dependencies are built into "
+                       "runtime\\, not installed on the fly."))
+        on_line(i18n.L("修法：重新运行 VibeMote 安装程序，选**同一个目录** —— "
+                       "它会把缺失/损坏的文件补回来（配置和键位不受影响）。",
+                       "Fix: run the VibeMote installer again and pick the **same folder** — "
+                       "it restores missing or damaged files (your config and keymap are kept)."))
         return 1
     py = ensure_venv(on_line)
     if py:
@@ -1278,15 +1278,19 @@ def host_pythonw():
 
 
 def best_pythonw():
-    """该用哪个解释器重启自己 —— 必须跟启动器（vbs）同一套优先级。
+    r"""该用哪个解释器重启自己 —— 必须跟启动器（start_remote.py / vbs）同一套优先级。
 
     ⚠ 不能用 sys.executable：当 app 跑在系统 Python、
     依赖却装在 .venv 里时，重启只会拉起又一个没依赖的自己 —— 死循环，
     用户看到的就是"重启了还是缺依赖"。
+
+    ★ 顺序 = **runtime\ 优先**（2026-11-12 与启动器对齐）：离线安装包只有 runtime\
+    是完整的，.venv 是壳（`home = C:\Python312`），干净机器上它会直接起不来。
     """
-    v = os.path.join(VENV, "Scripts", "pythonw.exe")
-    if os.path.exists(v):
-        return v
+    for cand in (os.path.join(HERE, "runtime", "pythonw.exe"),
+                 os.path.join(VENV, "Scripts", "pythonw.exe")):
+        if os.path.exists(cand):
+            return cand
     line = _read_python_txt()
     if line:
         return line

@@ -1,10 +1,67 @@
 # 更新日志
 
-## 未发布
+## v1.3.0（2026-11-12）—— 离线自包含安装包
+
+这一版只做一件事：**干净机器（没装过 Python、没装过虚拟声卡）装完就能用**。
+以前做不到，有两个硬伤，现在都修了。
+
+### 一、解释器真的随包了（`runtime\`，取代 `.venv`）
+
+- 以前 payload 里的 `.venv` 只是"壳"：`pyvenv.cfg` 的 `home = C:\Python312`，
+  标准库和 `python312.dll` 都在**开发机**上。装到干净机器上双击启动器，
+  只有一句 `No Python at 'C:\Python312\pythonw.exe'`（退出码 **103**），
+  用户看到的是"双击没反应"。
+- 现在 `program_files\runtime\` = 官方 `python-3.12.9-embed-amd64.zip` 解压
+  （`python.exe` / `pythonw.exe` / `python312.dll` / `python312.zip` 标准库
+  / `LICENSE.txt`）+ 从 `.venv` 复制来的 `Lib\site-packages\`，
+  `python312._pth` 加了 `Lib\site-packages` 与 `import site`。
+  实测 `sys.prefix` == `sys.base_prefix` == `runtime\` 本身，`sys.path` 里
+  **没有任何** `C:\Python*` 项 → 真自包含。
+- 启动顺序三处统一改成 **`runtime\` 优先，`.venv` 其次**：
+  `start_remote.py`（`find_pythonw`）、`app.py`（`best_pythonw`）、
+  `启动遥控器.vbs`（`PickPy`）。**别调回去**，理由见说明书坑 22。
+- payload 不再带 `.venv`（170.1 MB 死重）；`setup_wizard.collect_program_files`
+  把 `.venv` 加进 `SKIP_DIRS`。升级安装时若发现旧 `.venv` 会自动删掉。
+- 安装前新增 `verify_payload()`：缺 `runtime\` / 缺依赖 / 缺 `app.py` **当场报错**，
+  不再"装完才发现是废包"。
+
+### 二、虚拟声卡随包 + 安装向导接管
+
+- `program_files\vbcable\` 放官网 Pack45 的 6 个原文件，**一字节未改**
+  （`VBCABLE_Setup_x64.exe` SHA256 `734C35DF…` 与 `app.py`/`uninstall.py`
+  里的常量一致）。
+- 安装向导新增第 3 步「虚拟声卡」：检测注册表判断装没装；没装就把
+  **它自己的安装器**拉起来（不静默、不改文件），并明确提示
+  **"点 Install Driver" + "装完必须重启一次电脑"**。
+- 安装向导加 `uac_admin=True`：写 `C:\Program Files` 和装系统级音频驱动
+  本来都要管理员，一次 UAC 全解决。
+
+### 三、安装向导其它修正
+
+- 卸载快捷方式改指 `runtime\pythonw.exe "uninstall.py" --gui`
+  （原来直接指 `uninstall.py`，干净机器上没有 `.py` 文件关联，
+  双击只会弹"选择打开方式"）。带 `.venv` / 裸 `.py` 两级兜底。
+- 空间提示改成**动态计算**（原来硬编码 200 MB，现在按 payload 实际体积
+  并显示目标盘剩余空间，不够时红色告警）。
+- 完成页加"首次启动去设置里**扫描遥控器**"提示。
+- payload `config.json` **模板化**：`remote_addr` 置空、`keys.youtube`
+  的浏览器路径改 `C:\Windows\explorer.exe`（靠默认浏览器打开），
+  不再带开发机的 Chrome/Maxthon 路径与遥控器地址。
+- 两个 exe 补上 **PE 版本信息**（`version_setup.txt` / `version_launcher.txt`）：
+  以前"文件属性 → 详细信息"里版本/产品名/公司**全是空的**。
+- `.spec` 不再装进用户目录（那是构建配方，没有源码用不上）。
+
+### 四、同步
+
+- `app.py` / `setup_wizard.py` `APP_VERSION = "1.3.0"`；
+  `write_uninstall_info` 默认版本 1.3.0；`CHANGELOG` / `THIRD-PARTY-NOTICES`
+  / 说明书坑 22 同步更新。
+
+### 五、同期并入的两个修复（原「未发布」条目）
 
 两件事：**frida 版本上限收到 `<17.25`**，以及**语音结尾不再被吃掉**（`voice.tail_ms`）。
 
-### 一、frida 版本上限 `<17.25`
+#### 1) frida 版本上限 `<17.25`
 
 - `requirements-keys.txt`：`frida>=17.18,<18` → `frida>=17.18,<17.25`（实测可用 17.24.3）。
 - 原因：frida **17.25.x** 改成「无文件注入」，注入 `WUDFHost.exe` 直接失败 —— 表现是按键通道
@@ -14,7 +71,7 @@
 - 同步更新：`README.md` / `README.en.md` / `说明.md` / `说明.en.md` / `THIRD-PARTY-NOTICES.md`
   里的版本号与范围；排障步骤见开发过程说明书 `03_维护手册_frida与已知死路.md` 第 4 节。
 
-### 二、语音结尾不再被吃掉（松开后补录）
+#### 2) 语音结尾不再被吃掉（松开后补录）
 
 真机量化（安装版 14:55–16:47，50 段会话）：**音频时长比按住时长少 1.4 秒（中位）**，
 表现就是"说完松手，最后几个字没了"。加埋点把 1.4 秒拆开（2026-11-12，6 段会话）：

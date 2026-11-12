@@ -18,14 +18,31 @@ Windows 上的小工具：把 Google TV / Chromecast 蓝牙遥控器变成"按�
 1. 系统是 **Windows 10/11 x64**？
 2. 遥控器是 **Google TV / Chromecast 蓝牙遥控器**（其他遥控器报文格式不同）？
 3. 用哪种包？
-   - `vibe-mote-offline-v1.zip`（约 61MB，**自带 Python，推荐**）→ 什么都不用装
+   - **`VibeMote_Setup.exe`（安装向导，约 203MB 数据，干净电脑最省事 ← 推荐）**：
+     自带 Python 运行时（`runtime\`）**和**虚拟声卡官方安装文件，目标机**不需要 Python、不需要联网**
+   - `vibe-mote-offline-v1.zip`（约 61MB，自带 Python）→ 解压就能跑，但虚拟声卡要自己装
    - `vibe-mote-v1.zip`（约 900KB）→ 需要 **Python 3.10+**，让用户从
      [python.org](https://www.python.org/downloads/) 装，**务必勾选 `Add python.exe to PATH`**，
      不要用 Microsoft Store 版本
 
 ## 1. 安装
 
-**离线包**：解压 → 双击 `启动遥控器.vbs` → 完成（没别的步骤）。
+**安装向导 `VibeMote_Setup.exe`（推荐）**：双击 → 一路「下一步」→ 完成 → **重启一次电脑**。
+
+| 向导会做什么 | 你要提醒用户什么 |
+|---|---|
+| 装到 `C:\Program Files\VibeMote 遥控器`（会弹**一次 UAC**，因为写 Program Files + 装音频驱动都要管理员） | 弹 UAC 时点「是」，不是软件在提权乱来 |
+| 第 3 步**拉起 VB-CABLE 自己的安装器**（包里带的是官网 Pack45 的 6 个原文件，一字节未改） | 在那个窗口里**点 Install Driver** 并同意它的许可；**装完必须重启**（VB-Audio 官方要求），不重启语音会「没声音」 |
+| 建桌面 / 开始菜单快捷方式 + 卸载入口 | 卸载入口指向包内 `runtime\pythonw.exe`，不用装 Python |
+
+装完**首次启动要去「设置」里点「扫描遥控器」** —— 安装包里**不含**任何蓝牙地址，
+`config.json` 的 `remote_addr` 是空的。
+
+> 为什么不能只带 `.venv`：venv 只是"壳"，`pyvenv.cfg` 指向创建它的那台机器的
+> `C:\Python312`，干净机器上退出码 103（详见 `01_踩坑与经验_总纲.md` 坑 22/23）。
+> 向导装出来的目录里是 `runtime\`（官方 embeddable 3.12.9），`sys.prefix` 就是它自己。
+
+**离线包**：解压 → 双击 `启动遥控器.vbs` → 完成（没别的步骤；虚拟声卡按界面清单装）。
 
 **轻包**（目标机器有 Python 时）：
 
@@ -69,11 +86,15 @@ foreach ($m in $mirrors) {
 
 ```powershell
 # 2.1 启动（双击 启动遥控器.vbs 一样；--silent 表示不开浏览器）
-.venv\Scripts\pythonw.exe app.py --silent
-
+#     安装向导版：用包内 runtime；离线包/开发目录：runtime 优先，没有才用 .venv
+.\runtime\pythonw.exe app.py --silent
 # 2.2 等 5 秒，问接口要状态
 Invoke-RestMethod http://127.0.0.1:8787/api/state | ConvertTo-Json -Depth 5
 ```
+
+> 想确认"真的不依赖系统 Python"，在安装目录跑
+> `.\runtime\python.exe -c "import sys;print(sys.prefix, sys.base_prefix)"` ——
+> 两个都应该是安装目录下的 `runtime`，`sys.path` 里**不该出现** `C:\Python*`。
 
 判读 `/api/state`：
 
@@ -133,9 +154,10 @@ Invoke-RestMethod http://127.0.0.1:8787/api/state | ConvertTo-Json -Depth 5
 界面「设置 → 清理 / 卸载」是**逐项勾选**的（默认什么都不勾），也可以命令行：
 
 ```powershell
-.venv\Scripts\python.exe uninstall.py --items=venv,pycache   # 只删这两项
-.venv\Scripts\python.exe uninstall.py --items=all            # 全删（含配置）
-.venv\Scripts\python.exe uninstall.py --dry-run              # 只列清单，什么都不做
+.\runtime\python.exe uninstall.py --items=venv,pycache      # 只删这两项
+.\runtime\python.exe uninstall.py --items=all               # 全删（含配置）
+.\runtime\python.exe uninstall.py --dry-run                 # 只列清单，什么都不做
+# 老包/开发目录里没有 runtime\ 时，把 .\runtime\python.exe 换成 .venv\Scripts\python.exe
 ```
 
 可选 id：`task, run, kill, frida_helper, frida_svc, venv, pycache, pythontxt, logs, config, qwen, cable`。
@@ -152,11 +174,15 @@ Invoke-RestMethod http://127.0.0.1:8787/api/state | ConvertTo-Json -Depth 5
 
 ## 6. 环境
 
-Windows 10/11 x64 · Python 3.10 或更高 · 语音需要 VB-CABLE 虚拟声卡
-（它自己的安装器需要一次管理员权限，与本程序无关）。
+Windows 10/11 x64 · **安装向导 / 离线包自带 Python 3.12.9**（轻包才需要系统装 3.10+）·
+语音需要 VB-CABLE 虚拟声卡（它自己的安装器需要一次管理员权限，与本程序无关）。
 
-**VB-CABLE 怎么装**：两个 zip 里都带了官方安装器**和驱动文件**，让用户点界面首页清单
-「虚拟声卡」那一行的**一键安装**（或「设置 → 虚拟声卡」那张卡）即可。有两件事要提前告诉他：
+**VB-CABLE 怎么装**：
+- **安装向导 `VibeMote_Setup.exe`**：向导第 3 步会**自动拉起** VB-CABLE 自己的安装器；
+- **离线包 / 轻包**：让用户点界面首页清单「虚拟声卡」那一行的**一键安装**
+  （或「设置 → 虚拟声卡」那张卡）即可。
+
+有两件事要提前告诉他：
 - 会弹一次 UAC（那是声卡安装器自己要求的，与本程序无关），**还要在他自己的窗口里点一下
   「Install Driver」** —— 官方安装器**不提供静默安装参数**（没有 `-i`/`-s`/`/S` 这类开关），
   所以这一步不可能全自动；

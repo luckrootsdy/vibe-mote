@@ -6,7 +6,7 @@
 
 | 组件 | 版本 | 许可 | 用途 |
 |---|---|---|---|
-| Python 运行时 | 3.12.9 | PSF License Agreement | 解释器（见下方「运行时」一节：目前由目标机自带，未随包） |
+| Python 运行时 | 3.12.9（官方 embeddable 包） | PSF License Agreement | 解释器，**已随包**放在 `runtime\`（见下方「运行时」一节） |
 | [frida](https://frida.re/) | 17.24.3 | wxWindows Library Licence 3.1（LGPL-2.1 加例外） | 读取蓝牙 HID 报文，实现按键映射 |
 | [bleak](https://github.com/hbldh/bleak) | 3.0.2 | MIT | 蓝牙 GATT：语音键状态 + 麦克风音频 |
 | [sounddevice](https://github.com/spatialaudio/python-sounddevice) | 0.5.6 | MIT | 音频输入输出（PortAudio 绑定） |
@@ -14,27 +14,28 @@
 | [pycparser](https://github.com/eliben/pycparser) | 3.12 | BSD-3-Clause | cffi 的依赖 |
 | [winrt-runtime](https://pypi.org/project/winrt-runtime/) | 4.1.0 | MIT | bleak 在 Windows 上的依赖 |
 | [typing_extensions](https://pypi.org/project/typing-extensions/) | 4.16.0 | PSF-2.0 | 类型标注兼容层 |
+| [pip](https://pip.pypa.io/) | 24.3.1 | MIT | 随 `runtime\` 一起带上的依赖管理工具（**仅供诊断**，离线版不联网装包） |
 | [VB-CABLE](https://vb-audio.com/Cable/)（安装器 + 驱动） | Driver Pack 45 | VB-Audio 自有许可（donationware，见下） | 虚拟声卡：把遥控器麦克风送进输入法 |
 
 ## 许可原文在哪
 
-- 安装包：上述 Python 组件的各自 `LICENSE` / `METADATA` 随包分发，可在
-  `program_files\.venv\Lib\site-packages\<组件>-<版本>.dist-info\` 下找到。
-- **Python 解释器本体（PSF 许可原文）目前不随包**：`.venv` 只是一个"壳"，
-  `pyvenv.cfg` 的 `home` 指向目标机上的 Python 安装目录，标准库和 `python3XX.dll`
-  都在那边。**目标机没有 Python 3.12 时程序起不来**（详见 `01` 坑 22）。
-  若要做成真正自包含，需把解释器（建议官方 embeddable 包）连同 PSF 许可原文
-  `LICENSE.txt` 一起放进包里 —— 届时本节要同步更新。
+- **Python 解释器本体（PSF 许可原文）**：`program_files\runtime\LICENSE.txt`
+  （官方 embeddable 包自带，36,874 字节，一字节未改）。
+- **Python 第三方组件**：各自的 `LICENSE` / `METADATA` 随包分发，可在
+  `program_files\runtime\Lib\site-packages\<组件>-<版本>.dist-info\` 下找到。
+- **`runtime\` 是真自包含**：`sys.prefix` == `sys.base_prefix` == `runtime\` 本身，
+  标准库在 `runtime\python312.zip`，不依赖目标机上的任何 Python。
+  （历史坑：早期包里的 `.venv` 只是"壳"，`pyvenv.cfg` 的 `home` 指向开发机的
+  `C:\Python312`，干净机器上退出码 103 —— 详见说明书坑 22。）
 - 轻包：依赖由 `pip` 从 PyPI 安装，许可文件在对应包目录里。
-- **VB-CABLE**：许可原文是官方原文件 `vbcable\readme.txt`，
+- **VB-CABLE**：许可原文是官方原文件 `program_files\vbcable\readme.txt`，
   也在 VB-Audio 官网 <https://vb-audio.com/Cable/> 与其安装器的许可页上。
-  （**注意：`vbcable\` 目前并不在安装包里**，见下方「VB-CABLE 的特别说明」。）
 
 ## frida 的特别说明
 
 frida 采用 wxWindows Library Licence 3.1（LGPL-2.1 附「静态链接例外」）。
 本项目以**独立文件**形式分发它（未静态链接进自有程序），
-使用者可以自行替换 `.venv\Lib\site-packages\frida\` 下的文件。
+使用者可以自行替换 `runtime\Lib\site-packages\frida\` 下的文件。
 
 ## VB-CABLE 的特别说明
 
@@ -42,18 +43,26 @@ frida 采用 wxWindows Library Licence 3.1（LGPL-2.1 附「静态链接例外�
 作者是 **Vincent Burel（VB-Audio Software）**，版权与许可归其所有，
 本项目**不主张任何权利**。
 
-- **现状（2026-11-12 实测，与本文早期版本不一致，特此更正）**：当前安装包
-  `vibe-mote-main_Win64_Setup\program_files\` 里**没有** `vbcable\` 目录，
-  状态接口报 `cable.files_ok = false`、缺 `vbMmeCable64_win10.inf` 与
-  `vbaudio_cable64_win10.sys`。本机语音能用，是因为**之前手工装过** VB-CABLE
-  （`installed: true / registered: true`）；**换一台干净电脑装完，语音会完全没反应，
-  而按键正常**，最容易被误判成"软件坏了"。
-- **计划做法（与下面许可条款一致）**：把官网原包里的 6 个原文件原样放进
-  `program_files\vbcable\`（`VBCABLE_Setup_x64.exe`、`VBCABLE_ControlPanel.exe`、
-  `vbMmeCable64_win10.inf`、`vbaudio_cable64_win10.sys`、`vbaudio_cable64_win10.cat`、
-  `readme.txt`），**一个字节都不改**，由安装向导调用**它自己的 GUI**，用户自己点
-  「Install Driver」并同意它的许可。仓库 **git 里不含**这些文件。
-  在那之前，安装向导/界面只给官网下载指引（<https://vb-audio.com/Cable/>）。
+- **现状（2026-11-12 已随包）**：`program_files\vbcable\` 里放着官网原包的
+  6 个文件，**一个字节都没改**（SHA256 与 `app.py` / `uninstall.py` 里的
+  `CABLE_SETUP_SHA256` 一致，实测 `734C35DF…`）：
+
+  | 文件 | 字节 |
+  |---|---|
+  | `VBCABLE_Setup_x64.exe` | 937,728 |
+  | `VBCABLE_ControlPanel.exe` | 930,048 |
+  | `vbMmeCable64_win10.inf` | 11,361 |
+  | `vbaudio_cable64_win10.sys` | 140,760 |
+  | `vbaudio_cable64_win10.cat` | 12,862 |
+  | `readme.txt` | 3,846 |
+
+  安装向导会把它**复制到安装目录**，然后**拉起它自己的 GUI**（用户自己点
+  「Install Driver」并同意许可）；客户端界面上的「安装虚拟声卡」走同一条路。
+  **不做静默安装**。仓库 git 里也**不含**这 6 个文件（它们只在安装包 payload 里）。
+- **历史教训（为什么现在必须随包）**：早期安装包 `program_files\` 里没有
+  `vbcable\`，状态接口报 `cable.files_ok = false`。开发机语音能用，是因为
+  **之前手工装过** VB-CABLE；换一台干净电脑装完，**语音完全没反应而按键正常**，
+  最容易被误判成"软件坏了"。
 - **官方许可（`vbcable\readme.txt` 原文要点）**：
   - VB-CABLE 是 **donationware**：允许**原样（AS IS）复制与分发**整个包，
     但**不允许在未经作者同意的情况下把 VB-CABLE 包集成进另一个软件的安装流程**；

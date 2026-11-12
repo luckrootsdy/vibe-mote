@@ -11,7 +11,9 @@ cable → your IME types the text**. 14 buttons are freely remappable —
 bundles Python, so the target machine needs nothing installed).
 
 > ⬇️ **[Download the latest release](releases/latest)**
-> · `vibe-mote-offline-v1.zip` (~61MB, **bundles Python + everything** ← recommended)
+> · `VibeMote_Setup.exe` (**installer, ~203MB of data**: bundles the Python runtime + the official virtual-audio-cable
+>   files; double-click on a clean machine and you are done ← **easiest, recommended**)
+> · `vibe-mote-offline-v1.zip` (~61MB, **bundles Python + everything**)
 > · `vibe-mote-offline-voice-v1.zip` (~14MB, **voice only, no frida** ← pick this for AV-wary or work PCs)
 > · `vibe-mote-v1.zip` (~900KB, for machines that already have Python 3.10+)
 > Changelog → [`CHANGELOG.md`](CHANGELOG.md) ·
@@ -179,15 +181,31 @@ What is inside (and why it is so large):
 
 | Component | Size | Notes |
 |---|---|---|
-| Python 3.13 official **embeddable** package | 10.4MB | The official distribution meant for "embedding into an application and running directly" |
-| bleak / sounddevice / cffi / winrt-* | ~5MB | Required for voice |
-| frida | 47.3MB | Required for key mapping (this is the bulk of the bundle) |
+| Python **3.12.9** official **embeddable** package | ~15MB extracted | The official distribution meant for "embedding into an application and running directly"; `sys.prefix` is `runtime\` itself, so it depends on no Python on the target machine |
+| bleak / sounddevice / cffi / winrt-* | ~12MB | Required for voice |
+| frida | 157.9MB (~47MB compressed) | Required for key mapping (this is the bulk of the bundle) |
 
 > The two "Install dependencies" buttons in the UI tell you directly on the offline bundle that "dependencies are bundled, nothing to install".
 
 > 📌 **The bundled `runtime\` is part of the program itself; the cleanup tool will not delete it.**
 > That is because "Install all" in the UI installs pip packages and **cannot reinstall** a Python distribution —
 > once deleted, you can never get back to the "no-install" state. So the cleanup list simply does not offer that option.
+
+### Route E: the installer `VibeMote_Setup.exe` (easiest on a clean machine)
+
+Same self-contained runtime as route D, plus three things:
+
+| Step | What the wizard does |
+|---|---|
+| 1 | Installs to `C:\Program Files\VibeMote 遥控器` (one UAC prompt covers everything) |
+| 2 | **Launches VB-CABLE's own installer** (the bundle ships the 6 official files, unmodified; the user clicks Install Driver themselves) |
+| 3 | Creates Desktop / Start-menu shortcuts + an uninstall entry (which points at the bundled `runtime\pythonw.exe`) |
+
+When it finishes it tells you two things: **reboot once** (the virtual audio cable needs it) and
+**on first launch go to Settings and "Scan for remote"** (no Bluetooth address is pre-filled).
+
+> Uninstall: Start menu → "卸载 VibeMote", or Settings → Apps → Uninstall.
+> **`runtime\` is not deleted by the uninstaller** (same reason as above); delete the install folder to remove everything.
 
 ---
 
