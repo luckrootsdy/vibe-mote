@@ -1,22 +1,22 @@
 ' ===========================================================================
 '  VibeMote launcher  (PURE ASCII ON PURPOSE - DO NOT ADD CHINESE HERE)
 ' ---------------------------------------------------------------------------
-'  Why ASCII only: wscript reads .vbs using the system ANSI codepage (GBK on
-'  Chinese Windows). If this file contains UTF-8 Chinese comments, the bytes
-'  get misread and the parser dies with "Unterminated string constant"
-'  (800A0409). Line endings must be CRLF too.
+' Why ASCII only: wscript reads .vbs using the system ANSI codepage (GBK on
+' Chinese Windows). If this file contains UTF-8 Chinese comments, the bytes
+' get misread and the parser dies with "Unterminated string constant"
+' (800A0409). Line endings must be CRLF too.
 '
-'  What it does: find a pythonw.exe and start app.py with a HIDDEN window
-'  (window style 0), so the user never sees a black console box.
-'  Double-click  -> starts the app, waits until the console answers, opens browser
-'  --silent      -> start only, no browser (used by the autostart entry)
+' What it does: find a pythonw.exe and start app.py with a HIDDEN window
+' (window style 0), so the user never sees a black console box.
+' Double-click  -> starts the app, waits until the console answers, opens browser
+' --silent      -> start only, no browser (used by the autostart entry)
 '
-'  Why it waits and checks (added 2026-09-13): app.py runs under pythonw.exe,
-'  where stdout is None - so any startup failure is COMPLETELY silent: no
-'  window, no error, no browser, nothing. The user report was literally
-'  "I extracted it and double-click does nothing". Now the launcher polls
-'  http://127.0.0.1:<port>/api/state and, if the app never answers, shows a
-'  message and opens client.log in Notepad so there is always a clue.
+' Why it waits and checks (added 2026-09-13): app.py runs under pythonw.exe,
+' where stdout is None - so any startup failure is COMPLETELY silent: no
+' window, no error, no browser, nothing. The user report was literally
+' "I extracted it and double-click does nothing". Now the launcher polls
+' http://127.0.0.1:<port>/api/state and, if the app never answers, shows a
+' message and opens client.log in Notepad so there is always a clue.
 ' ===========================================================================
 Option Explicit
 
@@ -78,8 +78,9 @@ before = MarkerStamp()
 ' really answers, so a failed start can never look like "nothing happened".
 cmd = """" & py & """ """ & base & "\app.py"" --silent"
 If boot Then cmd = cmd & " --boot"
-' 双击（非 --silent）：请求已有实例重建语音链路（"拿起来就用"）。
-' 若没实例在跑，app.py 会忽略 --heal 并正常启动一份新的。
+' Double-click (non-silent): ask a running instance to refresh the voice link
+' ("grab-and-go"). If no instance is running, app.py ignores --heal and just
+' starts a fresh copy normally.
 If Not silent Then cmd = cmd & " --heal"
 If port > 0 Then cmd = cmd & " --port " & port
 
@@ -292,7 +293,7 @@ Function PickPy()
   ' 4) scan one level of subdirectories under the usual Python roots
   roots = Array( _
     sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Programs\Python"), _
-    "C:\", "D:\DEV")
+   "C:\", "D:\DEV")
   For Each s In roots
     If fso.FolderExists(s) Then
       For Each f In fso.GetFolder(s).SubFolders
