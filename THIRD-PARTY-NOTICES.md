@@ -7,7 +7,7 @@
 | 组件 | 版本 | 许可 | 用途 |
 |---|---|---|---|
 | Python 运行时 | 3.13 | PSF License Agreement | 离线包内置的解释器 |
-| [frida](https://frida.re/) | 17.18.0 | wxWindows Library Licence 3.1（LGPL-2.1 加例外） | 读取蓝牙 HID 报文，实现按键映射 |
+| [frida](https://frida.re/) | 17.24.3 | wxWindows Library Licence 3.1（LGPL-2.1 加例外） | 读取蓝牙 HID 报文，实现按键映射 |
 | [bleak](https://github.com/hbldh/bleak) | 3.0.2 | MIT | 蓝牙 GATT：语音键状态 + 麦克风音频 |
 | [sounddevice](https://github.com/spatialaudio/python-sounddevice) | 0.5.6 | MIT | 音频输入输出（PortAudio 绑定） |
 | [cffi](https://cffi.readthedocs.io/) | 2.1.1 | MIT | sounddevice 的依赖 |
