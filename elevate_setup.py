@@ -26,6 +26,19 @@ import time
 import winreg
 import xml.sax.saxutils as sx
 
+# ★ 这个脚本几乎总是被**别的进程用管道抓输出**来跑（app.py 的 run_reset_bt /
+#   run_elevate_setup，capture_output=True）。管道时 Python 的 stdout 编码取系统
+#   ANSI 代码页（中文系统 = gbk），下面 log() 里的 ✓ / ✗ 编不出来就
+#   UnicodeEncodeError —— 整个提权脚本当场死掉。
+#   真机踩过：点「重置蓝牙电台」永远没反应，elevate_setup.log 里只剩第一行
+#   「=== 重置蓝牙电台 ===」，而界面上还照样显示"完成"。所以这里统一改成
+#   UTF-8 + replace（宁可显示成 ?，也不能因为一个符号把功能打死）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(HERE, "elevate_setup.log")
 XML = os.path.join(HERE, "_task.xml")
@@ -37,7 +50,12 @@ CREATE_NO_WINDOW = 0x08000000
 
 def log(msg):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except Exception:
+        # 双保险：上面 reconfigure 之后正常不会走到这里；但即使流被换成不支持的
+        # 东西，也不能让整个提权流程挂掉（uninstall.py 里早就是这么写的）
+        pass
     try:
         with open(LOG, "a", encoding="utf-8") as f:
             f.write(line + "\n")

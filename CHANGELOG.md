@@ -1,5 +1,69 @@
 # 更新日志
 
+## v1.3.2（2026-11-14）—— 「重置蓝牙电台」按钮从来没真正生效过
+
+用户反馈原话：**「今天遥控器问题比较多的」**。`/api/state` 里
+`voice.connected=false`、`voice.note` = `未连上（按一下遥控器任意键会重试；
+一直不行就点「重置蓝牙电台」）`，`client.log` 一直刷
+`缺少 ATVV 特征（本次枚举到 4 个服务：00001800, 00001801, 0000180a, 0000180f）`。
+按提示点了「重置蓝牙电台」——`elevate_setup.log` 里只有一行标题，蓝牙一动没动。
+
+### 一、根因：提权脚本被管道抓输出 + gbk，第一个 `✓`/`✗` 就把进程打死
+
+两个 bug 叠在一起，才表现为"按钮静默无效"：
+
+| # | 位置 | 事实 |
+| --- | --- | --- |
+| 1 | `app.py: run_reset_bt()` | 用 `subprocess.run(..., capture_output=True)` 抓 `elevate_setup.py --reset-bt` 的输出 → 子进程 stdout 是**管道**，编码取系统 ANSI 代码页（中文系统 = gbk），不是 UTF-8 |
+| 2 | `elevate_setup.py: log()` | `print(line, flush=True)` **没有 try/except**（`uninstall.py` 的 `log()` 早就有） |
+
+于是 `log("管理员权限 ✓…")` 抛
+`UnicodeEncodeError: 'gbk' codec can't encode character '\u2717'`
+（同文件里还有 `✗`）→ 进程在写完标题后立刻退出，什么都没做。
+
+现场证据：`elevate_setup.log` 只剩
+`[01:18:59] === 重置蓝牙电台 ===`（第一行没有 `✓`/`✗`，所以写得进去），
+而 `client.log` 里明明白白写着 `结束：重置蓝牙电台`。
+
+第二个 bug 在 `app.py`：`run_reset_bt()` **不看返回码**，不管 rc 都报"完成"
+→ 用户点按钮 → 界面说完成 → 蓝牙其实一动没动。
+
+复现（决定性证据）：`D:\TEMP22\opencode\repro_reset_bt_encoding.py`
+（去掉 `PYTHONUTF8` + `capture_output=True`）→ `rc=1`，stderr 就是上面那条
+`UnicodeEncodeError`，`elevate_setup.log` 只剩第一行。
+
+### 二、修复
+
+- **`elevate_setup.py`**：模块顶部对 `sys.stdout` / `sys.stderr` 做
+  `reconfigure(encoding="utf-8", errors="replace")`（失败则 pass），
+  `log()` 里的 `print` 再包一层 `try/except`。
+  原则：**宁可显示成 `?`，也不能因为一个符号把整个提权流程打死**。
+- **`app.py: run_reset_bt()`**：改为看 `p.returncode`。`rc=0` 才报"完成"；
+  否则界面追加「✗ 没成功（什么都没动）—— 看下面几行」，并用 `BUS.log` 写人话
+  （含"拔遥控器电池 10 秒 / 完全关机再开机"这条兜底）。
+
+### 三、验收（同一台机器、同一条件）
+
+| 场景 | 结果 |
+| --- | --- |
+| 修前：无 `PYTHONUTF8` + 管道 | `rc=1`，`UnicodeEncodeError`，日志只有标题行 |
+| 修后：无 `PYTHONUTF8` + 管道 | `rc=1`（非提权，本该如此），正常输出 `✗ 当前不是管理员，什么都没做…` + `DONE`，日志三行齐全 |
+| 修后：真机点按钮（app 提权实例） | 日志完整：`管理员权限 ✓` → `RADIO` → `pnputil` → 回退「禁用 + 启用」，不再是"只写一行" |
+
+### 四、顺带查清的两件事
+
+1. **遥控器只枚举到 4 个服务，不是我们连错了设备。**
+   `42:3F:6A:5D:88:16` 在 Windows PnP 里是 **Chromecast Remote**
+   （`VID&0218D1 PID&9450`），注册了 6 个服务，其中含 ATVV
+   `AB5E0001-5A21-4F05-BC7D-AF01F617B664`；但 bleak 每次只拿到
+   1800/1801/180a/180f —— 是"设备睡着 + HID 栈占着唯一那条连接"，不是枚举代码的问题
+   （`voice.py` 里 `use_cached_services` 必须 True 那套逻辑仍然正确）。
+2. **这台机器的蓝牙适配器没法用软件重启。**
+   `pnputil /restart-device` 报「需要重新启动系统才能完成配置操作!」，
+   `Disable-PnpDevice` 报「禁用失败（继续）: 常规故障」。
+   重置后电台 `Status OK`，但语音从"连上 4 个服务"退成"连接超时"（遥控器不广播，
+   被系统 HID 持有）。**软件侧没有更多手段**，只能重启电脑或拔遥控器电池 10 秒。
+
 ## v1.3.1（2026-11-13）—— 装进 `C:\Program Files` 后「语音不行」的根因修复
 
 用户反馈原话：**「语音不行 其余都ok」**，`/api/state` 里 `voice.note` =

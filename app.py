@@ -50,7 +50,7 @@ if HERE not in sys.path:
 import i18n  # noqa: E402  （必须在 sys.path 之后就位）
 
 APP_NAME = "VibeMote"
-APP_VERSION = "1.3.1"          # 报 bug 时请带上这个版本号（界面「设置 → 界面」能看到）
+APP_VERSION = "1.3.2"          # 报 bug 时请带上这个版本号（界面「设置 → 界面」能看到）
 WEB = os.path.join(HERE, "web")
 CONFIG = os.path.join(HERE, "config.json")
 REQUIREMENTS = os.path.join(HERE, "requirements.txt")
@@ -1739,18 +1739,38 @@ def run_reset_bt(on_line):
     on_line(i18n.L("重置蓝牙电台：禁用 → 等 3 秒 → 启用（期间蓝牙设备会短暂断开）…",
                    "Resetting the Bluetooth radio: disable → wait 3 s → enable "
                    "(Bluetooth devices drop briefly)…"))
+    rc = -1
     try:
         p = subprocess.run([sys.executable, ELEVATE_PY, "--reset-bt"],
                            capture_output=True, text=True, encoding="utf-8",
                            errors="replace", cwd=HERE, timeout=120)
+        rc = p.returncode
         for ln in (p.stdout or "").splitlines():
             on_line(ln)
         if p.stderr:
             on_line((p.stderr or "").strip()[:300])
-        on_line(i18n.L("完成 —— 几秒后会自动重连遥控器",
-                       "Done — the remote reconnects automatically in a few seconds"))
     except Exception as e:
         on_line(i18n.L(f"失败：{e!r}", f"Failed: {e!r}"))
+        BUS.log(i18n.L(f"✗ 重置蓝牙电台没能跑起来：{e!r}",
+                       f"✗ Resetting the Bluetooth radio could not run: {e!r}"))
+        return rc
+    # ★ 一定要看返回码。以前这里不管 rc 都报"完成"，而提权脚本在管道 + gbk 下
+    #   会在写完标题就 UnicodeEncodeError 退出（rc=1，什么都没做）—— 用户点了
+    #   按钮，界面说"完成"，蓝牙其实一动没动。见 elevate_setup.log 只剩第一行。
+    if rc == 0:
+        on_line(i18n.L("完成 —— 几秒后会自动重连遥控器",
+                       "Done — the remote reconnects automatically in a few seconds"))
+        BUS.log(i18n.L("重置蓝牙电台：完成", "Bluetooth radio reset: done"))
+    else:
+        on_line(i18n.L("✗ 没成功（什么都没动）—— 看下面几行",
+                       "✗ Failed (nothing was changed) — see the lines above"))
+        BUS.log(i18n.L(
+            f"✗ 重置蓝牙电台失败（rc={rc}，什么都没动）。提权脚本的输出在上面几行；"
+            f"实在不行就拔遥控器电池 10 秒再装回，或完全关机再开机。",
+            f"✗ Bluetooth radio reset failed (rc={rc}, nothing was changed). "
+            f"The elevated script's output is above; if it keeps failing, take the "
+            f"remote's battery out for 10 s, or fully power-cycle the PC."))
+    return rc
 
 
 def follow_elevate_log():
