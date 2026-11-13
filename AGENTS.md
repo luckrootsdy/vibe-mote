@@ -145,6 +145,8 @@ Invoke-RestMethod http://127.0.0.1:8787/api/state | ConvertTo-Json -Depth 5
 | `挂载失败：PermissionDenied` | Frida 要一次提权被拒 | 让用户点「一键优化」，或重试一次 |
 | 按语音键日志无「开始说话」 | 蓝牙没连上 | 看 `voice.connected` |
 | `voice.connected` 一直是 false、日志一直刷「连接超时」，**但遥控器按键有用** | BLE 设备只接受一个连接，Windows 的 HID 把那条唯一的连接攥住不放 → 遥控器不再广播（`BleakScanner` 扫不到它，扫别的 BLE 设备正常） | 让用户点「设置 → 诊断 → **重置蓝牙电台**」；或让用户把遥控器**电池取出 10 秒**。**别**去动配对/驱动 |
+| 点了「重置蓝牙电台」，界面说完成，但 `elevate_setup.log` **只有一行** `=== 重置蓝牙电台 ===` | v1.3.1 及更早：提权脚本被管道 + gbk 打死（`✓`/`✗` 触发 `UnicodeEncodeError`），而且调用方不看返回码 → 静默失败 | 升级到 **v1.3.2**（提权脚本 stdout 强制 UTF-8、`log()` 包 try/except、`run_reset_bt()` 看 `rc`）。急救：管理员 PowerShell 里 `cd` 到安装目录跑 `runtime\python.exe elevate_setup.py --reset-bt` |
+| 重置日志出现 `需要重新启动系统才能完成配置操作!` / `禁用失败（继续）: 常规故障` | 该蓝牙适配器（如 MediaTek USB）**不支持运行中重启**，`Disable-PnpDevice` 也被驱动拒绝 | **让用户重启电脑**（或拔遥控器电池 10 秒）。软件侧没有别的开关，别再试 `pnputil`/`bthserv` |
 | 有「开始说话」但输入法没反应 | 输入法不认程序注入的按键 | 千问：开「允许注入」；豆包：不支持，换输入法 |
 | 装了 frida、但 `keys.ready` 一直 false / 日志说找不到 frida | **杀软把 frida 静默隔离了**（离线包里 frida 约 47MB，模块名 `frida-agent.dll`/`frida-helper-*.exe` 在多家 AV 特征库里） | 让用户把程序目录加进杀软白名单，再点「安装按键映射依赖」。**别**让他关 Defender |
 | `挂载失败：TransportError: the connection is closed` 反复出现（几十~上百次），而语音一切正常 | **杀软 / EDR 拦了 Frida 的注入** —— **公司电脑上最常见**（真机日志里 145 次全是这个错误） | 让用户请 **IT 把程序目录加进白名单**（我们不改系统设置、不关 Defender、不需要驱动）。**别**建议关杀软，更别想绕过公司策略。放行之前：**语音可用、按键映射不可用**。让他点一次「设置 → 诊断 → 按键映射自检」，把这行证据写进日志再发给你 |
