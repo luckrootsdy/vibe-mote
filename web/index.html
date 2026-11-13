@@ -1167,12 +1167,17 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'dep.cableText': '语音的物理前提是 VB-CABLE 虚拟声卡：遥控器的麦克风得有地方出声，输入法才读得到。装它要一次管理员权限，装完必须重启一次。',
       'dep.cableBtn': '一键安装虚拟声卡',
       'dep.cableGhostTitle': '虚拟声卡现在用不了',
-      'dep.cableGhostText': '注册表里还有 VB-CABLE，但现在已经枚举不到可用的音频设备 —— 语音这会儿出不了字。**先重启一次**（VB-CABLE 卸载后要重启才算卸完）；重启后还不行，就点右边重装一次。',
+      'dep.cableGhostText': '注册表里还有 VB-CABLE，但现在已经枚举不到可用的音频设备 —— 语音这会儿出不了字。先重启一次（VB-CABLE 卸载后要重启才算卸完）；重启后还不行，就点右边重装一次。',
       'dep.cableGhostBtn': '重装虚拟声卡',
       'dep.cableGhostBtn2': '清除虚拟声卡残留',
+      // ── 程序目录不可写：本页面点任何按钮都修不了，只能重装（所以不配按钮）──
+      'dep.dataDirTitle': '程序目录写不进去 —— 设置存不下来',
+      'dep.dataDirText': '程序装在需要管理员权限的目录里（{0}），普通用户改不了它：点「扫描遥控器 → 保存设置」会失败，遥控器蓝牙地址存不下来，语音就永远不出字（按键是好的，所以很容易误判成"语音坏了"）。修法：右键安装包 →「以管理员身份运行」重装一次，装完就不用再管。',
+      'dataDir.row': '程序目录',
+      'dataDir.bad': '不可写（设置存不下来）',
       'act.cleanCableResidue': '清除虚拟声卡残留',
       'cable.residueStarted': '正在清除残留（只删 VB-CABLE 自己的那几处，会弹一次 UAC）…',
-      'cable.residueHint': '清完**重启一次**，再点「重装虚拟声卡」',
+      'cable.residueHint': '清完重启一次，再点「重装虚拟声卡」',
       // ── 「首次准备」清单（首页）：把"用起来之前要过的几关"一次摆出来 ──
       'setup.title': '首次准备',
       'setup.must': '必需',
@@ -1561,12 +1566,17 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'dep.cableText': 'The physical prerequisite for voice is the VB-CABLE virtual audio cable: the remote microphone needs somewhere to play before your input method editor can read it. Installing it needs administrator rights once, and a reboot afterwards.',
       'dep.cableBtn': 'Install the virtual audio cable',
       'dep.cableGhostTitle': 'The virtual audio cable is not usable right now',
-      'dep.cableGhostText': 'VB-CABLE is still in the registry, but no usable audio device is enumerated right now — so voice cannot type anything. **Reboot once first** (a VB-CABLE uninstall is not finalised until you reboot); if it still fails after that, click the button on the right to reinstall.',
+      'dep.cableGhostText': 'VB-CABLE is still in the registry, but no usable audio device is enumerated right now — so voice cannot type anything. Reboot once first (a VB-CABLE uninstall is not finalised until you reboot); if it still fails after that, click the button on the right to reinstall.',
       'dep.cableGhostBtn': 'Reinstall the virtual audio cable',
       'dep.cableGhostBtn2': 'Clear virtual-cable leftovers',
+      // ── Program folder not writable: no button here can fix it, only a reinstall (so no button) ──
+      'dep.dataDirTitle': 'The program folder is not writable — settings cannot be saved',
+      'dep.dataDirText': 'The program is installed in a folder that requires administrator rights ({0}), so a normal user cannot change it: “Scan for remotes → Save settings” fails, the remote Bluetooth address is never stored, and voice will never produce text (the buttons keep working, which makes it look like “voice is broken”). Fix: right-click the installer → “Run as administrator” and reinstall once; after that you never have to think about it.',
+      'dataDir.row': 'Program folder',
+      'dataDir.bad': 'not writable (settings cannot be saved)',
       'act.cleanCableResidue': 'Clear virtual audio cable leftovers',
       'cable.residueStarted': 'Clearing leftovers (only VB-CABLE’s own entries; one UAC prompt)…',
-      'cable.residueHint': '**Reboot once** when it finishes, then click “Reinstall the virtual audio cable”',
+      'cable.residueHint': 'Reboot once when it finishes, then click “Reinstall the virtual audio cable”',
       // ── "First-time setup" checklist (home page) ──
       'setup.title': 'First-time setup',
       'setup.must': 'required',
@@ -2222,7 +2232,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
         (s.versions.runtime ? t('st.runtime', s.versions.runtime) : '')));
     }
 
-    renderDeps(s.deps);
+    renderDeps(s.deps, s.data_dir);
     renderSetup(s);
     renderQwen(s);
     renderCable(s.cable);
@@ -2385,13 +2395,25 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
     if (hint) hint.textContent = (done >= 5) ? t('setup.allDone') : t('setup.hint');
   }
 
-  function renderDeps(deps) {
+  function renderDeps(deps, dataDir) {
     var box = $('#depsRows');
     var banner = $('#depBanner');
     var btn = $('#depBannerBtn'), btn2 = $('#depBannerBtn2');
     var title = $('#depBannerTitle');
     box.innerHTML = '';
+    btn.hidden = false;
     btn2.hidden = true;
+    // ★ 程序目录不可写排在最前面 —— 它会让"依赖全装好、声卡也在、按键全好"的机器
+    //   依然一句语音都出不来（遥控器蓝牙地址存不下来）。这个状态在本页面点任何按钮
+    //   都修不了（要管理员重跑安装程序），所以这一支**不给按钮**，只把话说清楚。
+    if (dataDir && dataDir.writable === false) {
+      box.appendChild(srow(t('dataDir.row'), t('dataDir.bad')));
+      title.textContent = t('dep.dataDirTitle');
+      $('#depBannerText').textContent = t('dep.dataDirText', dataDir.path || '');
+      btn.hidden = true;
+      banner.hidden = false;
+      return;
+    }
     if (!deps) {
       box.appendChild(srow(t('row.deps'), t('dep.unknown')));
       banner.hidden = true;

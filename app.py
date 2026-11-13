@@ -50,7 +50,7 @@ if HERE not in sys.path:
 import i18n  # noqa: E402  （必须在 sys.path 之后就位）
 
 APP_NAME = "VibeMote"
-APP_VERSION = "1.3.0"          # 报 bug 时请带上这个版本号（界面「设置 → 界面」能看到）
+APP_VERSION = "1.3.1"          # 报 bug 时请带上这个版本号（界面「设置 → 界面」能看到）
 WEB = os.path.join(HERE, "web")
 CONFIG = os.path.join(HERE, "config.json")
 REQUIREMENTS = os.path.join(HERE, "requirements.txt")
@@ -77,6 +77,58 @@ APPPID = os.path.join(HERE, "_app_pid.txt")
 #   否则每次自重启后新进程的计数从 0 开始 → 遥控器一直不在（比如用户出门了）
 #   就会变成"每 10 分钟重启一次客户端"的死循环。连上一次就把这个文件删掉。
 RECOVERY_STATE = os.path.join(HERE, "_auto_recovery.json")
+
+# ============================================================ 程序目录可写吗
+# ★ 2026-11-13：本程序把**运行时要写**的东西全放在自己目录里（CONFIG / client.log /
+#   _ready.txt / _run_state.txt / _app_pid.txt / _auto_recovery.json）。
+#   而默认装到 `C:\Program Files\…`，那棵树继承给 `BUILTIN\Users` 的只有 RX ——
+#   普通用户一个字节都写不进去。本机实测（把目录 ACL 设成 Users:(RX) 后以非提权身份跑）：
+#       config.json  -> PermissionError [Errno 13]
+#       client.log   -> PermissionError（Bus._open_log 里被 try/except 吞掉 → **完全静默**）
+#       _ready.txt   -> PermissionError（只记一条日志，而日志也写不进去）
+#   症状特别误导人：程序能开、按键全好（frida 走 HID，不写盘），
+#   但「扫描遥控器 → 保存」存不下来 → 蓝牙地址永远空 → **语音永远不出字**，
+#   而且程序目录里连一个 client.log 都没有，用户手上毫无线索。
+#   对策两层：
+#     ① 安装向导装完 icacls 授权（setup_wizard.grant_users_modify）—— 根治；
+#     ② 这里兜底：目录不可写时日志改写到 %LOCALAPPDATA%\VibeMote，结论摆进
+#        /api/state 的 data_dir 段，保存失败时给出能照着做的中文提示。
+def data_dir_writable(path=None):
+    """HERE 到底能不能写 —— **真写一个临时文件**试，别信 os.access。
+
+    os.access 在 UAC 虚拟化 / 只读 ACL / 网络盘上都会撒谎；写一次最诚实。
+    """
+    path = path or HERE
+    probe = os.path.join(path, "._wtest_%d.tmp" % os.getpid())
+    try:
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("x")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+_WRITABLE = []          # 只测一次（启动时定论，别每个请求都摸盘）
+
+
+def data_dir_ok():
+    if not _WRITABLE:
+        _WRITABLE.append(data_dir_writable())
+    return _WRITABLE[0]
+
+
+def user_data_dir():
+    """%LOCALAPPDATA%\\VibeMote —— 程序目录不可写时，日志的落脚点。"""
+    base = (os.environ.get("LOCALAPPDATA")
+            or os.path.join(os.path.expanduser("~"), "AppData", "Local"))
+    d = os.path.join(base, APP_NAME)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
 
 DEFAULT_PORT = 8787
 CREATE_NO_WINDOW = 0x08000000
@@ -219,6 +271,7 @@ class Bus:
         self.subs = []
         self.lock = threading.Lock()
         self.fh = None
+        self.log_path = None          # 真正写进去的那个文件（可能是 %LOCALAPPDATA% 那份）
         self._log_tried = False
         # ⚠ **故意不在这里开文件**。本对象是模块级的（BUS = Bus()），
         #   要是构造时就落盘，那任何"只是 import 一下"的场景（状态探针、测试脚本）
@@ -227,14 +280,24 @@ class Bus:
 
     def _open_log(self):
         self._log_tried = True
-        try:
-            if os.path.exists(self.LOG) and os.path.getsize(self.LOG) > self.LOG_MAX:
-                os.remove(self.LOG)
-            self.fh = open(self.LOG, "a", encoding="utf-8", buffering=1)
-            self.fh.write(f"\n===== 启动 {time.strftime('%Y-%m-%d %H:%M:%S')} "
-                          f"pid={os.getpid()} {sys.executable} =====\n")
-        except Exception:
-            self.fh = None
+        # ★ 2026-11-13：程序目录不可写（装在 C:\Program Files 的普通用户）时，
+        #   原来这里 `except Exception: self.fh = None` 就完了 —— 用户那边
+        #   **一条日志都没有**，"语音不行"只能靠猜。现在退到 %LOCALAPPDATA%\VibeMote。
+        for path in (self.LOG, os.path.join(user_data_dir(), "client.log")):
+            try:
+                if os.path.exists(path) and os.path.getsize(path) > self.LOG_MAX:
+                    os.remove(path)
+                self.fh = open(path, "a", encoding="utf-8", buffering=1)
+                self.log_path = path
+                self.fh.write(f"\n===== 启动 {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                              f"pid={os.getpid()} {sys.executable} =====\n")
+                if path != self.LOG:
+                    self.fh.write(f"[{os.getpid()}] 程序目录不可写（{self.LOG}），"
+                                  f"日志改写到 {path}\n")
+                return
+            except Exception:
+                self.fh = None
+        # 两处都写不进：只能留在内存里（界面/SSE 还能看到）
 
     def log(self, msg):
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
@@ -454,11 +517,23 @@ def save_config(cfg):
                 json.dump(clean, f, ensure_ascii=False, indent=2)
                 f.write("\n")
             os.replace(tmp, CONFIG)
-        except OSError:
+        except OSError as e:
             try:
                 os.remove(tmp)
             except OSError:
                 pass
+            # ★ 2026-11-13：权限问题必须说人话。原来直接抛 PermissionError，
+            #   界面上只闪一句 `PermissionError: [Errno 13] ...`，用户根本不知道
+            #   该干什么 —— 而这正是"按键全好、语音永远不行"的根因
+            #   （遥控器蓝牙地址存不下来）。实测见文件头的说明。
+            if isinstance(e, PermissionError) or not data_dir_ok():
+                raise PermissionError(i18n.L(
+                    f"配置写不进程序目录（{CONFIG}）：{e}。"
+                    f"程序被装在了需要管理员权限的目录里，普通用户改不了它。"
+                    f"请右键用「以管理员身份运行」重跑安装程序修复一次。",
+                    f"Cannot write the config ({CONFIG}): {e}. "
+                    f"The program is installed in a folder that needs administrator rights. "
+                    f"Re-run the installer as administrator to fix it."))
             raise
     return clean
 
@@ -2339,6 +2414,14 @@ def state_snapshot(cfg, roles=None):
     return {
         "running": bool(roles and roles.running),
         "remote_addr": cfg.get("remote_addr"),
+        # ★ 2026-11-13：程序目录能不能写。装进 C:\Program Files 的普通用户这里是 False ——
+        #   那种情况下「扫描遥控器 → 保存」一定失败，语音永远不出字，而按键照旧好用。
+        #   放在 state 里，用户报"语音不行"时一条命令就能定性，不用来回猜。
+        "data_dir": {
+            "path": HERE,
+            "writable": bool(data_dir_ok()),
+            "log": getattr(BUS, "log_path", None) or os.path.join(HERE, "client.log"),
+        },
         "voice": {
             "mode": (cfg.get("voice") or {}).get("mode", "hold"),
             "key": (cfg.get("voice") or {}).get("key", "RALT"),
@@ -3766,6 +3849,20 @@ def main():
     BUS.log("=" * 58)
     BUS.log(i18n.L("  遥控器客户端 启动", "  VibeMote client starting"))
     BUS.log("=" * 58)
+
+    # ★ 2026-11-13：装到 C:\Program Files 的普通用户写不了自己目录 →
+    #   遥控器地址存不下来（语音永远不通），日志也写不进去。这条必须**大声说**，
+    #   而且要给出下一步动作，否则用户只会看到"语音不行"。
+    if not data_dir_ok():
+        BUS.log(i18n.L(
+            f"⚠ 程序目录不可写（{HERE}）—— 「设置」里保存会失败，语音会因为存不下"
+            f"遥控器蓝牙地址而永远不出字（按键不受影响）。"
+            f"请右键用「以管理员身份运行」重跑安装程序修复；日志已改写到 "
+            f"{getattr(BUS, 'log_path', None) or user_data_dir()}。",
+            f"⚠ The program folder is not writable ({HERE}) — saving in Settings will fail, "
+            f"and voice will never work because the remote's Bluetooth address cannot be "
+            f"stored (keys are unaffected). Re-run the installer as administrator to fix it; "
+            f"the log has moved to {getattr(BUS, 'log_path', None) or user_data_dir()}."))
 
     # 上一次「退出后再删」的结果。那条路是**分离进程**干的，当时没法回报成功没有 ——
     # 它会留下一个结果文件，这里读出来如实说（否则"报成功其实没删掉"会重演：

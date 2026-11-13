@@ -1,5 +1,73 @@
 # 更新日志
 
+## v1.3.1（2026-11-13）—— 装进 `C:\Program Files` 后「语音不行」的根因修复
+
+用户反馈原话：**「语音不行 其余都ok」**，`/api/state` 里 `voice.note` =
+`还没填遥控器蓝牙地址（到设置页扫描一次）`。根因不在语音代码，在**权限**。
+
+### 一、根因：程序目录不可写 → 遥控器地址存不下来
+
+- 本程序把**运行时要写**的东西全放在自己目录：`config.json` / `client.log` /
+  `_ready.txt` / `_run_state.txt` / `_app_pid.txt` / `_auto_recovery.json`。
+- 而默认装到 `C:\Program Files\…`，那棵树继承给 `BUILTIN\Users` 的只有 **RX**。
+  v1.3.0 的安装向导**没有任何 icacls/ACL 代码** → 普通用户一个字节都写不进去。
+- 本机实测（把目录 ACL 设成 `Users:(RX)` 后以非提权身份写）：
+
+  | 文件 | 结果 |
+  | --- | --- |
+  | `config.json` | `PermissionError [Errno 13]` |
+  | `client.log` | `PermissionError`（`Bus._open_log` 里被 `try/except` 吞掉 → **完全静默**） |
+  | `_ready.txt` | `PermissionError`（只记一条日志，而日志也写不进去） |
+
+- 为什么症状这么怪：程序能开（启动器先探 HTTP，`_ready.txt` 写不进也不影响），
+  按键全好（frida 走 HID，不写盘），但「设置 → 扫描遥控器 → 保存」**存不下来**
+  → `remote_addr` 永远是空 → 语音永远不出字，而且一条日志都没有。
+  开发机是 Administrator，`D:\Program Files` 又给了 `Authenticated Users:(M)`，
+  所以这个坑一直没暴露。
+
+### 二、修复（两层）
+
+- **安装向导**：装完文件后执行
+  `icacls "<安装目录>" /grant *S-1-5-32-545:(OI)(CI)M /T /C /Q`
+  （SID 而不是名字，中文/日文系统上组名不叫 Users；`/T` 必须有，
+  已经复制进去的文件不会自动继承**事后**加的 ACE）。失败时完成页红字写明
+  后果 + 手工命令，不再"装完了事"。
+- **app.py 兜底**：
+  - 新增 `data_dir_writable()`（真写一个临时文件试，不信 `os.access`）；
+  - 程序目录不可写时，`client.log` 改写到 `%LOCALAPPDATA%\VibeMote\client.log`，
+    文件开头写明原因 —— 以后"用户手上没有日志"不会再发生；
+  - 启动日志加一条醒目警告（含下一步动作）；
+  - `save_config()` 遇到权限问题抛**人话**：
+    `配置写不进程序目录（…）：… 请右键用「以管理员身份运行」重跑安装程序修复一次。`
+    （原来只闪一句 `PermissionError: [Errno 13]`，用户不知道该干什么）；
+  - `/api/state` 新增 `data_dir: {path, writable, log}` —— 下次报"语音不行"，
+    一条命令就能定性，不用来回猜。
+- **网页横幅**：`data_dir.writable === false` 时首页顶部直接红字说明
+  「程序目录写不进去 —— 设置存不下来」+ 修法（这一支**不给按钮**，因为页面上
+  没有任何按钮能修它，只能管理员重装）。顺带修掉 `dep.cableGhostText` /
+  `cable.residueHint` 里会被原样显示的 `**`（这两处走 `textContent`，
+  Markdown 星号不会变粗体，只会露出星号）。
+
+### 三、验收（都是实测，不是推断）
+
+- `_test_install_e2e.py`：727 项、装完 `_acl_ok=True`、`icacls` 里出现
+  `BUILTIN\Users:(OI)(CI)(M)`、装好的副本 `--selftest` rc=0。
+- `test_readonly_runtime.py`（把安装目录 ACL 设成 `Users:(RX)` 再真跑起来）：
+  程序照样开、`/api/state` 的 `data_dir.writable=false`、
+  `POST /api/config` 返回上面那句人话、日志落到 `%LOCALAPPDATA%\VibeMote`
+  且写明"程序目录不可写"。
+- 两个 exe 重打包：`VibeMote_Setup.exe` 10,378,715 B
+  sha256 `00F5E2519FACC77C…`（`requireAdministrator`、PE 1.3.1）、
+  `启动遥控器.exe` 7,919,059 B sha256 `FD48846D09D5D4BA…`
+  （`asInvoker`、PE 1.3.1）；`_sync_deploy.py` 三处哈希不一致 **0**。
+
+### 四、装完还是要做的一步（不是 bug）
+
+安装包里的 `config.json` 是**模板**（`remote_addr` 为空），所以第一次启动后
+必须在「设置」里点一次「扫描遥控器」→ 点自己的遥控器 → 「保存设置」。
+语音链路（依赖 + 虚拟声卡 + 写入 `CABLE Input`）本来就已经就绪，
+缺的只是这一个地址。
+
 ## v1.3.0（2026-11-12）—— 离线自包含安装包
 
 这一版只做一件事：**干净机器（没装过 Python、没装过虚拟声卡）装完就能用**。
