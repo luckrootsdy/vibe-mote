@@ -325,7 +325,7 @@ def write_uninstall_info(dst_root, app_name="VibeMote 遥控器", version="1.3.1
 # ---------------------------------------------------------------------------
 class InstallerApp:
     APP_NAME = "VibeMote 遥控器"
-    APP_VERSION = "1.3.1"
+    APP_VERSION = "1.3.2"
     PUBLISHER = "VibeMote"
 
     def __init__(self, root):
