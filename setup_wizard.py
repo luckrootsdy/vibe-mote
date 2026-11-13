@@ -279,7 +279,35 @@ def install_files(src_root, dst_root, file_list, progress_cb=None):
             progress_cb(i, total, rel)
 
 
-def write_uninstall_info(dst_root, app_name="VibeMote 遥控器", version="1.3.0"):
+def grant_users_modify(dst_root):
+    """让**普通用户**也能写安装目录。返回 (ok, 输出)。
+
+    ★ 为什么必须做（2026-11-13 实测，不是猜的）：
+    默认装到 `C:\\Program Files\\…`，那棵树继承给 `BUILTIN\\Users` 的只有 RX。
+    而本程序把 config.json / client.log / _ready.txt / _app_pid.txt / _run_state.txt
+    全放在**自己目录**里。以非提权身份写这些文件，实测：
+        config.json  -> PermissionError [Errno 13]
+        client.log   -> PermissionError（app.py 的 Bus 里被 try/except 吞掉，静默）
+        _ready.txt   -> PermissionError
+    症状：程序能开、按键全好（frida 走 HID，不写盘），但「扫描遥控器 → 保存」
+    存不下来 → 蓝牙地址永远是空 → **语音永远不出字**，而且一条日志都没有。
+    v1.3.0 就是栽在这上面（用户反馈"语音不行 其余都ok"）。
+
+    用 SID 而不是名字：`*S-1-5-32-545` = BUILTIN\\Users，中文/日文系统上组名不叫 Users。
+    `/T` 是必须的 —— 已经复制进去的文件不会自动继承**事后**加的 ACE。
+    """
+    try:
+        r = subprocess.run(
+            ["icacls", dst_root, "/grant", "*S-1-5-32-545:(OI)(CI)M", "/T", "/C", "/Q"],
+            capture_output=True, text=True, errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW)
+        out = (r.stdout or "") + (r.stderr or "")
+        return r.returncode == 0, out.strip()
+    except Exception as e:                     # icacls 不在 / 被策略挡住
+        return False, f"{type(e).__name__}: {e}"
+
+
+def write_uninstall_info(dst_root, app_name="VibeMote 遥控器", version="1.3.1"):
     info = {"app_name": app_name, "version": version, "install_dir": dst_root,
             "installed_files": []}
     for dp, dn, fn in os.walk(dst_root):
@@ -297,7 +325,7 @@ def write_uninstall_info(dst_root, app_name="VibeMote 遥控器", version="1.3.0
 # ---------------------------------------------------------------------------
 class InstallerApp:
     APP_NAME = "VibeMote 遥控器"
-    APP_VERSION = "1.3.0"
+    APP_VERSION = "1.3.1"
     PUBLISHER = "VibeMote"
 
     def __init__(self, root):
@@ -311,6 +339,9 @@ class InstallerApp:
         self._cable_missing = cable_pack_missing(self._src_root)
         self._cable_launched = False
         self._size_bytes = None
+        # icacls 授权的结果（装完才知道）。None = 还没装 / 没跑。
+        self._acl_ok = None
+        self._acl_msg = ""
 
         self._build_banner()
         self.content = tk.Frame(self.root)
@@ -481,6 +512,19 @@ class InstallerApp:
         )
         tk.Label(self.content, text=msg, justify="left", wraplength=560).pack(pady=(4, 8))
 
+        # ★ 2026-11-13：授权失败必须当场说出来。否则用户后面看到的是
+        #   "保存没反应 / 语音不行"，而我们这边完全不知道权限没设上。
+        if self._acl_ok is False:
+            tk.Label(self.content,
+                     text="⚠ 没能把安装目录授权给普通用户（icacls 失败）。\n"
+                          "后果：「设置」里保存会失败，语音会因为存不下遥控器蓝牙地址"
+                          "而一直不出字（按键不受影响）。\n"
+                          "补救：把程序改装到用户目录（例如 D:\\VibeMote），"
+                          "或让管理员手动执行：\n"
+                          f'  icacls "{self._install_dir}" /grant *S-1-5-32-545:(OI)(CI)M /T\n'
+                          f"（原始输出：{self._acl_msg[:200]}）",
+                     fg="#c00000", wraplength=560, justify="left").pack(anchor="w", pady=(4, 8))
+
         if self._cable_launched:
             tk.Label(self.content,
                      text="⚠ 还有两件事：\n"
@@ -559,6 +603,14 @@ class InstallerApp:
                 self.root.update_idletasks()
 
             install_files(src_root, self._install_dir, files, progress)
+
+            # ★ 2026-11-13：把安装目录授权给普通用户（Users = Modify）。
+            #   不做这一步，装到 C:\Program Files 的普通用户写不了 config.json ——
+            #   表现就是"按键全好、语音永远不行"（遥控器蓝牙地址存不下来）。
+            #   详见 grant_users_modify() 的注释。
+            self.lbl_file.config(text="设置目录权限（让普通用户能保存配置）…")
+            self.root.update_idletasks()
+            self._acl_ok, self._acl_msg = grant_users_modify(self._install_dir)
 
             # 升级场景：老版本装过 .venv（170MB 的死重），现在有 runtime 了就可以删掉。
             # 删不掉也无所谓（可能被占着）—— 启动器已经优先 runtime，不影响使用。

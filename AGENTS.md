@@ -101,8 +101,10 @@ Invoke-RestMethod http://127.0.0.1:8787/api/state | ConvertTo-Json -Depth 5
 | 字段 | 期望 | 不对时怎么办 |
 |---|---|---|
 | `running` | `true` | 点 `/api/action {"action":"start"}`，或让用户在界面点「启动」 |
+| `data_dir.writable` | `true` | **程序目录不可写**（装进 `C:\Program Files` 且没授权）→ 保存设置一定失败、语音永远不出字。让用户**以管理员身份重跑安装程序**（v1.3.1 起向导会自动 `icacls` 授权） |
 | `deps.ok` | `true` | 依赖没装全，看 `deps.missing` |
 | `deps.keys_ok` | 装了 frida 才 `true` | 没装 frida 属正常 |
+| `remote_addr` | 有地址 | 空 = 还没扫描保存过 → 让用户「设置 → 扫描遥控器 → 点自己的遥控器 → 保存设置」 |
 | `voice.connected` | `true` | 遥控器在休眠 → **让用户按一下遥控器任意键** |
 | `keys.ready` | 装了 frida 才 `true` | 见上文 |
 
@@ -113,6 +115,10 @@ Invoke-RestMethod http://127.0.0.1:8787/api/state | ConvertTo-Json -Depth 5
 
 ## 3. 装完之后要告诉用户的三件事
 
+0. **扫描遥控器并保存**（安装包里的 `config.json` 是模板，`remote_addr` 为空）：
+   界面「设置 → 扫描遥控器」→ 点自己的遥控器 → 「保存设置」。
+   **不做这一步语音一定不出字**，而按键是好的 —— 用户会报成"语音不行 其余都ok"。
+   若保存时报「配置写不进程序目录」，那是权限问题，见 §4 第一行。
 1. **启动**：双击 `启动遥控器.vbs`（无黑框），浏览器会自动打开控制台
 2. **输入法里把麦克风选成 `CABLE Output (VB-Audio Virtual Cable)`**（否则语音出不了字）。
    ⚠ **只改输入法这一处**：系统默认录音设备要留给真实麦克风 —— 默认设备设成虚拟声卡的话，
@@ -132,6 +138,8 @@ Invoke-RestMethod http://127.0.0.1:8787/api/state | ConvertTo-Json -Depth 5
 
 | 日志现象 | 真因 | 处理 |
 |---|---|---|
+| `voice.note` = `还没填遥控器蓝牙地址（到设置页扫描一次）`（按键全好） | ①安装包模板里 `remote_addr` 为空，用户没扫过；②扫了但**保存失败**（程序目录不可写，见下一条） | 先看 `data_dir.writable`：`false` → 按下一行处理；`true` → 让用户「设置 → 扫描遥控器 → 点自己的遥控器 → 保存设置」，再确认 `/api/state` 的 `remote_addr` 有值 |
+| 保存设置报 `配置写不进程序目录`，或 `data_dir.writable=false`，或**程序目录里根本没有 `client.log`** | 装进 `C:\Program Files` 后，那棵树给 `BUILTIN\Users` 只有 RX（v1.3.0 没授权）→ `config.json` 写不进去 → 遥控器地址存不下来 → 语音永远不出字；`client.log` 也被静默吞掉 | 让用户**以管理员身份重跑 v1.3.1 安装程序**（向导会 `icacls /grant *S-1-5-32-545:(OI)(CI)M`）。手工急救：管理员 PowerShell 跑同一条命令。v1.3.1 起日志会退到 `%LOCALAPPDATA%\VibeMote\client.log`，那里能看到原因 |
 | 一直 `连接超时` | 遥控器休眠（它平时不广播，按键后才醒一小会） | 按一下遥控器任意键 —— 程序**一收到遥控器报文就会立刻重试**；连着失败时会退避到最多 45 秒一轮 |
 | `缺少 ATVV 特征` + 只枚举到 4 个服务 | 有另一个客户端占着蓝牙通道 | 关掉其它客户端（含旧版），再点「重启」 |
 | `挂载失败：PermissionDenied` | Frida 要一次提权被拒 | 让用户点「一键优化」，或重试一次 |

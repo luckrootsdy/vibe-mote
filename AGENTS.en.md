@@ -105,8 +105,10 @@ Reading `/api/state`:
 | Field | Expected | What to do if it is wrong |
 |---|---|---|
 | `running` | `true` | Call `/api/action {"action":"start"}`, or have the user click "Start" in the UI |
+| `data_dir.writable` | `true` | **The program folder is not writable** (installed into `C:\Program Files` without an ACL grant) → saving settings always fails and voice never produces text. Have the user **re-run the installer as administrator** (since v1.3.1 the wizard runs `icacls` itself) |
 | `deps.ok` | `true` | Dependencies are incomplete; check `deps.missing` |
 | `deps.keys_ok` | `true` only if frida is installed | Not having frida installed is normal |
+| `remote_addr` | an address | Empty = never scanned/saved → have the user go "Settings → Scan for remotes → click their remote → Save settings" |
 | `voice.connected` | `true` | The remote is asleep → **have the user press any button on the remote** |
 | `keys.ready` | `true` only if frida is installed | See above |
 
@@ -117,6 +119,11 @@ on startup failure the launcher shows a prompt and opens it automatically.
 
 ## 3. Three things to tell the user after installation
 
+0. **Scan for the remote and save it** (the `config.json` in the installer is a template with an empty `remote_addr`):
+   "Settings → Scan for remotes" → click their remote → "Save settings".
+   **Without this step voice never produces text**, while the buttons work fine — users report it as
+   "voice doesn't work, everything else is OK".
+   If saving reports "cannot write the config to the program folder", that is a permissions problem — see the first rows of §4.
 1. **Launch**: double-click `启动遥控器.vbs` (no console window); the browser opens the console automatically
 2. **Set the microphone in the input method editor to `CABLE Output (VB-Audio Virtual Cable)`** (otherwise voice input produces no text).
    ⚠ **Change it only there**: leave your real microphone as the system default recording device — if the default is the
@@ -136,6 +143,8 @@ The first step is always: POST /api/action {"action":"check"} and see which laye
 
 | Log symptom | Real cause | Handling |
 |---|---|---|
+| `voice.note` = `还没填遥控器蓝牙地址（到设置页扫描一次）` ("no remote Bluetooth address yet") while the buttons all work | ① the installer's template has an empty `remote_addr` and the user never scanned; ② they scanned but **saving failed** (program folder not writable, see the next row) | Check `data_dir.writable` first: `false` → handle the next row; `true` → have the user go "Settings → Scan for remotes → click their remote → Save settings", then confirm `remote_addr` in `/api/state` is filled |
+| Saving settings reports `配置写不进程序目录` ("cannot write the config to the program folder"), or `data_dir.writable=false`, or there is **no `client.log` in the program folder at all** | Installed into `C:\Program Files`, whose ACL gives `BUILTIN\Users` only RX (v1.3.0 granted nothing) → `config.json` cannot be written → the remote address is never stored → voice never produces text; `client.log` is swallowed silently too | Have the user **re-run the v1.3.1 installer as administrator** (the wizard runs `icacls /grant *S-1-5-32-545:(OI)(CI)M`). Manual first aid: run the same command in an administrator PowerShell. Since v1.3.1 the log falls back to `%LOCALAPPDATA%\VibeMote\client.log`, which states the reason |
 | Constant `connection timeout` | Remote is asleep (it does not advertise while idle; it only wakes for a moment after a key press) | Press any button on the remote — the program **retries immediately whenever it sees a remote report**, and backs off to at most a 45-second retry interval while it keeps failing |
 | `missing ATVV characteristic` + only 4 services enumerated | Another client is holding the Bluetooth channel | Close other clients (including older versions), then click "Restart" |
 | `attach failed: PermissionDenied` | Frida's one-time elevation request was denied | Have the user click "One-click optimization", or retry once |
