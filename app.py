@@ -135,64 +135,29 @@ CREATE_NO_WINDOW = 0x08000000
 
 
 # --------------------------------------------------------------- 打开控制台窗口
-# ★ 2026-11-14 用户两条反馈，其实是同一个根因：
-#   ①「遥控器控制台占了我满屏，没有最小化、也没法关闭，操作别的软件很不方便」
-#   ②「用最小化它会彻底退出，任务栏里没有小窗、没有图标」
-#   现场证据（过程产物\探针脚本\probe_console_window.py，只读）：
-#     · 窗口是 **Maxthon** 开的（pid=39968），不是默认浏览器 Edge（UserChoice=MSEdgeHTM）；
-#     · 窗口 rect 落在 \\.\DISPLAY2（2560x1440 @ (-2560,-235)），主屏是 1920x1200 @ (0,0)；
-#     · 最小化后 rect=(-21333,-21333) 仍然"属于" DISPLAY2 → 主屏任务栏当然没有它的按钮。
-#   结论：**不能再用 os.startfile(url) 把地址丢给"系统默认浏览器"**。谁来打开、
-#   开多大、有没有标题栏、最小化去哪，全都不在我们手里 —— 第三方浏览器还会带上
-#   自己的全屏/独立窗口/最小化到托盘设置，于是"满屏没有按钮"和"最小化就消失"
-#   会随它的模式随机出现（用户说的"两种显示形式随机出现"就是这么来的）。
-#   改成：自己指定 Chromium 内核浏览器，用 --app= 开一个**普通窗口** ——
-#     显式给尺寸和位置（主屏工作区居中，比屏幕小），标题栏/最小化/关闭都是系统的；
-#     用独立 user-data-dir，免得和用户日常浏览器的窗口状态、权限级别互相打架。
-#     机器上实在没有 Edge/Chrome 才回退 os.startfile / webbrowser。
+# ★ 2026-11-14 用户反馈：「遥控器控制台偶尔会以**满屏、没有最小化/关闭按钮**的形态
+#   出现（鼠标移到上面才冒出一个叉叉），这时操作别的软件很不方便」。
+#   同一天还观察到另一种形态：正常的浏览器窗口（最小化、任务栏按钮都正常）。
+#   现场证据（过程产物\探针脚本\probe_console_window.py / probe_console_style.py，只读）：
+#     · 窗口是**默认浏览器 Maxthon（遨游）**开的（pid=39968 / 37028）；
+#     · 那种"满屏"形态里，窗口落在 \\.\DISPLAY2（2560x1440 @ (-2560,-235)），
+#       而主屏是 1920x1200 @ (0,0) → 主屏任务栏看不到它的按钮；
+#     · 最小化后 rect=(-21333,-21333) 仍"属于" DISPLAY2。
+#   用户拍板（2026-11-14）：「继续用遨游，只治满屏无按钮」—— 所以这里**保留
+#   os.startfile(url)**（尊重用户的默认浏览器和它的书签/扩展），只在窗口出现后
+#   做一次**事后矫正**（_doctor_console_window）：
+#     · 缺 WS_CAPTION / WS_SYSMENU / WS_MINIMIZEBOX → 补上（+ SWP_FRAMECHANGED 重画边框）；
+#     · 不在主屏工作区里、或者尺寸超过工作区 92% → SW_RESTORE + 摆回主屏居中。
+#   正常窗口一律不动 —— 用户自己摆好的位置要尊重。
 CONSOLE_TITLES = ("遥控器控制台", "Remote Console", "VibeMote")
 
-
-def _console_profile_dir():
-    """控制台专用浏览器配置目录 —— 与用户日常浏览器完全隔离。
-
-    为什么必须隔离：客户端以最高权限运行（装在 C:\\Program Files），而用户日常
-    浏览器是普通权限。Chromium 的**默认** profile 被另一个权限级别占着时，
-    要么另起一个进程、要么直接退出；窗口大小/位置也会被日常使用污染。
-    """
-    d = os.path.join(user_data_dir(), "console-profile")
-    try:
-        os.makedirs(d, exist_ok=True)
-    except OSError:
-        pass
-    return d
-
-
-def _chromium_exe():
-    """找 Edge / Chrome 的可执行文件；没有就返回 None。
-
-    环境变量 VIBEMOTE_BROWSER 可以手工指定（排障用：换成便携版浏览器）。
-    """
-    cands = []
-    env = os.environ.get("VIBEMOTE_BROWSER")
-    if env:
-        cands.append(env)
-    for base in (os.environ.get("ProgramFiles(x86)"),
-                 os.environ.get("ProgramFiles"),
-                 os.environ.get("LOCALAPPDATA")):
-        if not base:
-            continue
-        cands.append(os.path.join(base, "Microsoft", "Edge", "Application",
-                                  "msedge.exe"))
-        cands.append(os.path.join(base, "Google", "Chrome", "Application",
-                                  "chrome.exe"))
-    for p in cands:
-        try:
-            if p and os.path.isfile(p):
-                return p
-        except OSError:
-            pass
-    return None
+# 一个"能最小化、能拖动改大小、能关掉"的窗口该有的样式位
+WS_CAPTION = 0x00C00000
+WS_SYSMENU = 0x00080000
+WS_MINIMIZEBOX = 0x00020000
+WS_MAXIMIZEBOX = 0x00010000
+WS_THICKFRAME = 0x00040000
+GWL_STYLE = -16
 
 
 def _primary_work_area():
@@ -248,16 +213,17 @@ def _console_windows():
         return []
 
 
-def _fit_console_window(before, rect):
-    """把**本次新出现的**控制台窗口调成"普通窗口"：主屏居中、比屏幕小。
+def _doctor_console_window(before, rect):
+    """给**本次新出现的**控制台窗口做一次事后矫正（用户拍板：继续用遨游）。
 
-    ★ 为什么必须用 Win32 兜底，而不是只靠 --window-size / --window-position：
-      2026-11-14 实测 —— 这台机器上 Edge 已经在跑（--user-data-dir=C:\\TEMP\\EdgeUserDate），
-      再带 `--app=… --user-data-dir=<另一个目录> --window-size=1400,950` 启动时，
-      **命令行被转发给了已有实例**：新目录根本没被创建、也没有新的 msedge 进程，
-      窗口是已有进程开的，尺寸是它自己记的 **945x1132**（高 1132 / 工作区 1152 = 98%，
-      用户看到的就是"又满屏了"）。所以尺寸只能事后自己设。
-      同理，窗口的进程 ID 也不是我们 Popen 出来的那个 —— 只能按**标题 + 新出现**认。
+    两种毛病都治，且只在真的有问题时才动手：
+      ① 没有标题栏/最小化/关闭按钮（遨游的"应用/全屏"形态）→ 补样式位 + 重画边框；
+      ② 不在主屏工作区里、或尺寸超过工作区 92%（满屏、被丢到第二块屏）→
+         SW_RESTORE + 摆回主屏居中。
+    正常窗口（用户自己摆过的位置/大小）一律不动。
+
+    ★ 为什么必须事后做：窗口是浏览器自己创建的，我们拿不到它的启动参数；
+      而且同一台机器上"满屏"和"正常"两种形态会随机出现 —— 只能等窗口出来再看。
     """
     def _worker():
         try:
@@ -267,7 +233,7 @@ def _fit_console_window(before, rect):
             left, top, aw, ah = _primary_work_area()
             x, y, w, h = rect
             hwnd = 0
-            deadline = time.time() + 10.0
+            deadline = time.time() + 12.0
             while time.time() < deadline:
                 time.sleep(0.25)
                 new = [n for n in _console_windows() if n not in before]
@@ -276,7 +242,13 @@ def _fit_console_window(before, rect):
                     break
             if not hwnd:
                 return
-            time.sleep(0.6)          # 窗口刚创建时 rect 还在跳，等它定下来
+            time.sleep(0.8)          # 窗口刚创建时 rect 还在跳，等它定下来
+            style = user32.GetWindowLongW(hwnd, GWL_STYLE) & 0xFFFFFFFF
+            need = 0
+            for bit in (WS_CAPTION, WS_SYSMENU, WS_MINIMIZEBOX,
+                        WS_MAXIMIZEBOX, WS_THICKFRAME):
+                if not style & bit:
+                    need |= bit
             r = wintypes.RECT()
             if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
                 return
@@ -285,16 +257,31 @@ def _fit_console_window(before, rect):
                           and r.bottom > top and r.top < top + ah
                           and cw > 200)
             too_big = cw > aw * 0.92 or ch > ah * 0.92
-            if on_primary and not too_big:
-                return               # 已经是正常窗口 —— 用户自己摆过就尊重他
+            if not need and on_primary and not too_big:
+                return               # 已经是正常窗口，别动它
+            if need:
+                user32.SetWindowLongW(hwnd, GWL_STYLE, style | need)
             if user32.IsIconic(hwnd):
                 user32.ShowWindow(hwnd, 9)              # SW_RESTORE
-            # SWP_NOZORDER | SWP_NOACTIVATE
-            user32.SetWindowPos(hwnd, 0, x, y, w, h, 0x0004 | 0x0010)
+            # SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED（改样式后必须重画边框）
+            flags = 0x0004 | 0x0010 | 0x0020
+            if need and on_primary and not too_big:
+                # 只补按钮，尺寸/位置保持浏览器的（SWP_NOSIZE | SWP_NOMOVE）
+                user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                                    flags | 0x0001 | 0x0002)
+            else:
+                user32.SetWindowPos(hwnd, 0, x, y, w, h, flags)
+            what = []
+            if need:
+                what.append(i18n.L("补上标题栏/最小化按钮", "added a title bar/minimize"))
+            if not on_primary:
+                what.append(i18n.L("从第二块屏搬回主屏", "moved back to the primary"))
+            elif too_big:
+                what.append(i18n.L(f"从 {cw}x{ch} 缩到 {w}x{h}",
+                                   f"resized from {cw}x{ch} to {w}x{h}"))
             BUS.log(i18n.L(
-                f"控制台窗口原来是 {cw}x{ch}（"
-                f"{'不在主屏' if not on_primary else '接近满屏'}），已调成 {w}x{h} 主屏居中",
-                f"Console window was {cw}x{ch}; resized to {w}x{h} on the primary monitor"))
+                "控制台窗口原来是满屏/无边框形态（" + "，".join(what) + "）",
+                "Console window was fullscreen/frameless (" + ", ".join(what) + ")"))
         except Exception:
             pass
 
@@ -302,45 +289,26 @@ def _fit_console_window(before, rect):
 
 
 def open_console(url, log=True):
-    """打开遥控器控制台，返回实际用的方式："app" / "shell" / "webbrowser"。
+    """打开遥控器控制台（用系统默认浏览器），返回 "shell" / "webbrowser"。
 
-    ★ 三个调用点（已有实例在跑 / 抢锁失败 / 正常启动完）都必须走这里，
-      否则 Maxthon 那种"满屏无边框、最小化就消失"的问题会随机复现。
+    ★ 三个调用点（已有实例在跑 / 抢锁失败 / 正常启动完）都必须走这里 ——
+      否则"满屏无按钮"那种形态没人管。
+
+    ★ 2026-11-14 用户拍板：**继续用遨游**（默认浏览器），只治满屏无按钮。
+      所以这里不用 --app 指定别的浏览器，只在窗口出来后做一次 _doctor_console_window。
     """
-    exe = _chromium_exe()
-    if exe:
-        x, y, w, h = _console_rect()
-        args = [exe,
-                f"--app={url}",
-                f"--window-size={w},{h}",
-                f"--window-position={x},{y}",
-                f"--user-data-dir={_console_profile_dir()}",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-sync",
-                "--disable-features=Translate,MediaRouter"]
-        try:
-            before = _console_windows()      # 先记下已开着的，只动"新出现的"那个
-            subprocess.Popen(args, creationflags=CREATE_NO_WINDOW,
-                             close_fds=True)
-            _fit_console_window(before, (x, y, w, h))
-            if log:
-                BUS.log(i18n.L(
-                    f"控制台窗口：{os.path.basename(exe)} 应用窗口 "
-                    f"{w}x{h}，主屏 ({x},{y})，带标题栏/最小化",
-                    f"Console window: {os.path.basename(exe)} app window "
-                    f"{w}x{h} at primary ({x},{y}) with a normal title bar"))
-            return "app"
-        except Exception as e:
-            if log:
-                BUS.log(i18n.L(
-                    f"应用窗口打不开（{e}），退回系统默认浏览器",
-                    f"App window failed ({e}); using the default browser"))
+    before = _console_windows()      # 先记下已开着的，只矫正"新出现的"那个
     try:
         os.startfile(url)
+        _doctor_console_window(before, _console_rect())
         return "shell"
     except Exception:
-        webbrowser.open(url)
+        try:
+            webbrowser.open(url)
+            _doctor_console_window(before, _console_rect())
+        except Exception as e:
+            if log:
+                BUS.log(i18n.L(f"控制台打不开：{e}", f"Could not open the console: {e}"))
         return "webbrowser"
 
 
