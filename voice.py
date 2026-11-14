@@ -1701,6 +1701,15 @@ class VoiceRole(threading.Thread):
 
         if not (audio and status):
             self.misses += 1
+            # ★ 2026-11-14：这条分支以前**从不设置 self.note**，于是界面一直显示
+            #   `未启动`（__init__ 的初值）—— 用户看到"就绪 / 未启动"，以为语音
+            #   没开，其实它每 10 秒在重连。note 必须跟着真实状态走。
+            self.note = i18n.L(
+                "只看到 4 个基础服务（ATVV 不在）—— 按住语音键 2 秒叫醒它，"
+                "一直不行就点「重置蓝牙电台」",
+                "Only the 4 basic services are exposed (no ATVV) — hold the VOICE key for "
+                "2 seconds to wake the remote; if it keeps failing, use "
+                "“Reset Bluetooth radio”")
             # ★ 计入"卡住"计数（2026-11-06 修正）：这条路径以前从不增加 _stuck，
             #   导致 _maybe_unstick 永远触发不了，只能无限重连。
             self._stuck = getattr(self, "_stuck", 0) + 1

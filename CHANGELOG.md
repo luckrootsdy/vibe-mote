@@ -64,6 +64,29 @@
    重置后电台 `Status OK`，但语音从"连上 4 个服务"退成"连接超时"（遥控器不广播，
    被系统 HID 持有）。**软件侧没有更多手段**，只能重启电脑或拔遥控器电池 10 秒。
 
+### 五、同一轮里又抓到的两个真 bug（都是"界面在撒谎"）
+
+用户看到的状态是 `语音通道 就绪 未启动`，而日志里明明每 10 秒在重连。查下去是两处：
+
+1. **`heal` 动作从来就是坏的** —— `app.py: _action()` 里写的是
+   `self.refresh_voice()`，但 `refresh_voice` 是 **`Roles` 的方法**，`Handler` 上没有。
+   实测（本机 8787）：`POST /api/action {"action":"heal"}` 返回
+   `{"ok": false, "msg": "AttributeError: 'Handler' object has no attribute 'refresh_voice'"}`
+   这有多要命：**已经有实例在跑时，启动器只发这一个 heal**（`start_remote.py`：
+   `if server_up(port): send_heal(port)`）→ 用户每双击一次启动器，等于什么都没发生，
+   而界面上看不出任何错。改成 `ROLES.refresh_voice()`。
+   验收（`D:\TEMP22\opencode\test_heal_fix.py`，隔离实例：8788 + 锁 49742 + 空地址）：
+   修后 `POST heal` → `{"ok": true, "msg": "语音已重建"}`，日志无 `AttributeError`。
+2. **"只剩 4 个基础服务"这条分支从不设置 `self.note`** —— `voice.py` 里
+   `if not (audio and status):` 只写日志、加计数，`note` 一直是 `__init__` 的初值
+   `未启动`。于是界面显示"未启动"（用户以为语音没开），实际它每 10 秒在重连。
+   现在该分支写 `只看到 4 个基础服务（ATVV 不在）—— 按住语音键 2 秒叫醒它…`，
+   `_loop_sessions()` 紧接着 `_emit("status", ...)` 会把它推到界面。
+
+**教训**：`note` / `state` 这类"给用户看的字段"，必须和"真正在做的事"在**同一处**更新。
+只在 `__init__` 和成功分支里赋值，失败分支就会永远显示初值 —— 用户看到的"未启动"
+和日志里的"每 10 秒重连"是矛盾的，而这种矛盾会直接把排查引到错方向。
+
 ## v1.3.1（2026-11-13）—— 装进 `C:\Program Files` 后「语音不行」的根因修复
 
 用户反馈原话：**「语音不行 其余都ok」**，`/api/state` 里 `voice.note` =

@@ -3233,9 +3233,15 @@ class Handler(BaseHTTPRequestHandler):
             ok, msg = ROLES.start()
             return self._json({"ok": ok, "msg": msg})
         if act == "heal":
-            # 启动遥控器.vbs 双击入口："拿起来就用"——只重建语音链路，
+            # 启动遥控器.vbs / 启动遥控器.exe 双击入口："拿起来就用"——只重建语音链路，
             # 不动按键映射、不重启进程。
-            ok, msg = self.refresh_voice()
+            # ★ 2026-11-14：这里原来是 `self.refresh_voice()` —— refresh_voice 是
+            #   **Roles 的方法**，Handler 上没有，于是每次 heal 都返回
+            #   `AttributeError: 'Handler' object has no attribute 'refresh_voice'`。
+            #   而"已经有实例在跑"时，启动器**只发这一个 heal**（不发别的），
+            #   所以用户每双击一次启动器，等于什么都没发生 —— 语音一直不恢复，
+            #   界面上还看不出错。改成走 ROLES。
+            ok, msg = ROLES.refresh_voice()
             return self._json({"ok": ok, "msg": msg})
         if act == "stop":
             ok, msg = ROLES.stop()
