@@ -1100,6 +1100,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'conn.down': '连接中断',
       'sig.wait': '等待遥控器信号',
       'sig.down': '收到 · {0}',
+      'sig.holding': '按住 · {0}',
       'sig.up': '松开 · {0}',
       'sig.unmapped': ' · 未映射',
       'hero.checking': '检测中',
@@ -1499,6 +1500,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'conn.down': 'Connection lost',
       'sig.wait': 'Waiting for remote signal',
       'sig.down': 'Pressed · {0}',
+      'sig.holding': 'Holding · {0}',
       'sig.up': 'Released · {0}',
       'sig.unmapped': ' · not mapped',
       'hero.checking': 'Checking',
@@ -2999,27 +3001,58 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
   }
 
   /* ==================== 遥控器实时事件 ==================== */
+  // ★ 2026-11-14：顶栏「等待遥控器信号」原来只有 2.6 秒寿命 —— 收到 down 之后
+  //   不管键还按不按着，2.6 秒一到就回「等待遥控器信号」。短按（音量/方向）看不出来，
+  //   但**语音键是按住说话，一按就是几秒**，于是用户看到「我明明按着，它还在等待」，
+  //   以为软件没收到。现在改成有状态：按住期间一直显示「按住 · X」，真的收到 up 才回静止态。
+  //   （HID 报文丢包时 up 可能永远不来，所以另留 60 秒兜底，绝不让顶栏卡死。）
+  var signalHeld = {};
+  var signalHoldTimer = null;
+
   // 回到"等待信号"的静止态（换语言时也用它，免得停在旧语言）
   function resetSignal() {
     var sig = $('#signal');
     var txt = $('#sigText');
+    signalHeld = {};
+    clearTimeout(signalTimer);
+    clearTimeout(signalHoldTimer);
     if (txt) txt.textContent = t('sig.wait');
     if (sig) sig.classList.remove('mapped', 'unmapped', 'flash');
   }
 
-  function signalPing(id, down) {
+  function signalPaint(id, held) {
     var sig = $('#signal');
     var txt = $('#sigText');
+    if (!sig || !txt) return;
     var mapped = !!effectiveMapping(id);
     sig.classList.remove('flash');
     void sig.offsetWidth;
     sig.classList.add('flash');
     sig.classList.toggle('mapped', mapped);
     sig.classList.toggle('unmapped', !mapped);
-    txt.textContent = (down ? t('sig.down', keyName(id)) : t('sig.up', keyName(id)))
+    txt.textContent = (held ? t('sig.holding', keyName(id)) : t('sig.up', keyName(id)))
       + (mapped ? '' : t('sig.unmapped'));
-    clearTimeout(signalTimer);
-    signalTimer = setTimeout(resetSignal, 2600);
+  }
+
+  function signalPing(id, down) {
+    if (down) {
+      signalHeld[id] = true;
+      // 按住期间**绝不**回到"等待"：把 2.6 秒的收尾计时器撤掉
+      clearTimeout(signalTimer);
+      clearTimeout(signalHoldTimer);
+      signalPaint(id, true);
+      // 兜底：万一 up 永远不来（丢包 / 断连 / 遥控器没电），60 秒后也要回静止态
+      signalHoldTimer = setTimeout(function () {
+        delete signalHeld[id];
+        if (!Object.keys(signalHeld).length) resetSignal();
+      }, 60000);
+    } else {
+      delete signalHeld[id];
+      clearTimeout(signalHoldTimer);
+      signalPaint(id, false);
+      clearTimeout(signalTimer);
+      signalTimer = setTimeout(resetSignal, 2600);
+    }
   }
 
   function onKeyEvent(id, down) {
