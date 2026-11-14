@@ -1780,9 +1780,10 @@ class VoiceRole(threading.Thread):
             if atvv_denied:
                 self.note = i18n.L(
                     "ATVV 被 Windows 拒绝（ACCESS_DENIED）—— 不是遥控器睡着，"
-                    "要在设置里删掉设备重新配对",
+                    "把遥控器电池取下 10 秒再装回（实测有效），不行再重启电脑",
                     "ATVV is blocked by Windows (ACCESS_DENIED) — the remote is not "
-                    "asleep; remove it in Settings and pair it again")
+                    "asleep; take its battery out for 10 s and put it back (this works), "
+                    "then reboot if it still fails")
             else:
                 # ★ 2026-11-14：这条分支以前**从不设置 self.note**，于是界面一直显示
                 #   `未启动`（__init__ 的初值）—— 用户看到"就绪 / 未启动"，以为语音
