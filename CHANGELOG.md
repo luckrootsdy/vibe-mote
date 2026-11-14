@@ -87,6 +87,41 @@
 只在 `__init__` 和成功分支里赋值，失败分支就会永远显示初值 —— 用户看到的"未启动"
 和日志里的"每 10 秒重连"是矛盾的，而这种矛盾会直接把排查引到错方向。
 
+### 六、「只剩 4 个服务」的真相：不是遥控器在睡觉，是 Windows 拒绝访问 ATVV
+
+用 WinRT 原生 API 直接问 Windows（`D:\TEMP22\opencode\probe_gatt_status.py`，连跑 5 轮，结果一致）：
+
+```
+GetGattServicesAsync(CACHED) -> 8 个服务
+  1800 / 1801 / 180a / 180f            SUCCESS
+  1812 / ae40 / ab5e0001 / d343bfc0    ACCESS_DENIED   ← ATVV 在这里
+```
+
+bleak 3.0.2 的 winrt 后端 `_get_services()` 里有一句
+`if result.status == GattCommunicationStatus.ACCESS_DENIED: continue`，
+被拒的服务被**静默丢掉** → `client.services` 只剩 4 个 → 日志写成「只剩 4 个基础服务」。
+
+后果很重：从 09:14 起程序一直教用户「按住语音键 2 秒叫醒它」，用户按了两小时都没用 ——
+遥控器根本醒着（按键全好、电量 88%、PnP 节点 `LastArrivalDate` 就是刚刚）。
+而且 09:13:10 保活心跳 `Not connected` → 09:14:12 程序**自动关开蓝牙电台**解卡 →
+09:23 起 ATVV 一直 `ACCESS_DENIED`：电台一关一开，链路重新握手，绑定/加密状态只会更糟。
+
+改动（`voice.py`）：
+
+1. 新增 `gatt_truth(addr)`：用 WinRT 列出真实服务表 + 每个服务的 status，返回
+   `{"total": 8, "ok": [...], "denied": [...], "atvv": "DENIED"}`；60 秒最多跑一次。
+2. `if not (audio and status):` 分支按真话分两种说法：
+   - `atvv=DENIED` → note/日志直说「不是遥控器睡着，是绑定/加密链路坏了，
+     设置里删除设备重新配对（或先重启电脑）」，**不再**教用户按语音键；
+   - 真只给 4 个 → 保留原来的「半睡」提示。
+3. `atvv_denied` 时**禁止** `_maybe_unstick()` 关开电台，也不再弹「只剩 4 个基础服务」
+   的唤醒提示 —— 这两个动作只会让状态更糟。
+4. 该分支现在会设置 `self.note`（以前从不设置，界面永远显示「未启动」）。
+
+验证：`D:\TEMP22\opencode\test_gatt_truth.py`（真实设备，只读）→
+`{"total": 8, "atvv": "DENIED", "denied": ["00001812","0000ae40","ab5e0001","d343bfc0"]}`；
+`py_compile rc=0`。
+
 ## v1.3.1（2026-11-13）—— 装进 `C:\Program Files` 后「语音不行」的根因修复
 
 用户反馈原话：**「语音不行 其余都ok」**，`/api/state` 里 `voice.note` =
