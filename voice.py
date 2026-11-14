@@ -846,6 +846,61 @@ class VoiceKey:
         return True
 
 
+# ============================================================ 诊断：问 Windows 真话
+async def gatt_truth(addr, timeout=8.0):
+    r"""用 WinRT 原生 API 问一句真话：遥控器到底给了几个服务、哪个被拒绝。
+
+    ★★ 2026-11-14 实测（本机 10:50，遥控器醒着、按键全好）★★
+        GetGattServicesAsync(CACHED)  ->  8 个服务
+            1800 / 1801 / 180a / 180f            SUCCESS
+            1812 / ae40 / ab5e0001 / d343bfc0    ACCESS_DENIED
+    bleak 3.0 的 winrt 后端在 `_get_services()` 里遇到 ACCESS_DENIED 就
+    `continue`（注释写的是"Windows 不让访问系统自己占用的服务"），于是
+    `client.services` 只剩 4 个 —— 日志就变成「只剩 4 个基础服务」。
+    也就是说：**那不是遥控器在睡觉，是链路/绑定层把 ATVV 拒了**。
+    从 09:14 起日志一直教用户"按住语音键叫醒它"，按了两小时也没用，
+    因为方向本来就错。这个函数就是为了以后别再错第二次。
+
+    返回（失败返回 None，永不抛异常）：
+        {"total": 8, "ok": ["00001800", ...], "denied": ["00001812", ...],
+         "atvv": "DENIED" | "OK" | "MISSING"}
+    """
+
+    async def _run():
+        from winrt.windows.devices.bluetooth import (
+            BluetoothLEDevice, BluetoothCacheMode)
+        num = int(str(addr).replace(":", ""), 16)
+        dev = await BluetoothLEDevice.from_bluetooth_address_async(num)
+        if dev is None:
+            return None
+        try:
+            res = await dev.get_gatt_services_async(BluetoothCacheMode.CACHED)
+            ok, denied, atvv = [], [], "MISSING"
+            for s in res.services:
+                u = str(s.uuid).lower()[:8]
+                try:
+                    cr = await s.get_characteristics_async(
+                        BluetoothCacheMode.CACHED)
+                    good = int(cr.status) == 0
+                except Exception:
+                    good = False
+                (ok if good else denied).append(u)
+                if u == "ab5e0001":
+                    atvv = "OK" if good else "DENIED"
+            return {"total": len(res.services), "ok": ok,
+                    "denied": denied, "atvv": atvv}
+        finally:
+            try:
+                dev.close()
+            except Exception:
+                pass
+
+    try:
+        return await asyncio.wait_for(_run(), timeout)
+    except Exception:
+        return None
+
+
 # ============================================================ 语音角色
 class VoiceRole(threading.Thread):
     """独立线程里跑一个 asyncio 事件循环，保持 ATVV 长连接。"""
@@ -868,6 +923,10 @@ class VoiceRole(threading.Thread):
         self.relay_obj = None
         self.connected = False
         self.note = i18n.L("未启动", "Not started")
+        # ★ 2026-11-14：Windows 侧的真话（几个服务 / ATVV 是否被 ACCESS_DENIED）。
+        #   见 gatt_truth()：bleak 会把被拒的服务静默丢掉，只看 bleak 会误判。
+        self._truth = None
+        self._truth_at = 0.0
         # 遥控器电量（0~100，读不到就是 None）。纯诊断信息，绝不参与连接逻辑。
         self.battery = None
         self._battery_at = 0.0            # 上次成功读到电量的时间
@@ -1701,31 +1760,76 @@ class VoiceRole(threading.Thread):
 
         if not (audio and status):
             self.misses += 1
-            # ★ 2026-11-14：这条分支以前**从不设置 self.note**，于是界面一直显示
-            #   `未启动`（__init__ 的初值）—— 用户看到"就绪 / 未启动"，以为语音
-            #   没开，其实它每 10 秒在重连。note 必须跟着真实状态走。
-            self.note = i18n.L(
-                "只看到 4 个基础服务（ATVV 不在）—— 按住语音键 2 秒叫醒它，"
-                "一直不行就点「重置蓝牙电台」",
-                "Only the 4 basic services are exposed (no ATVV) — hold the VOICE key for "
-                "2 seconds to wake the remote; if it keeps failing, use "
-                "“Reset Bluetooth radio”")
+            # ★★ 2026-11-14：先问 Windows 一句真话，再决定该说什么 ★★
+            #   bleak 会把 ACCESS_DENIED 的服务静默丢掉，所以「只剩 4 个」有两种
+            #   完全不同的原因，处理方式也完全不同：
+            #     · 遥控器真的只给 4 个（半睡）        → 按语音键 / 取电池
+            #     · Windows 有 8 个但 ATVV 被拒（ACCESS_DENIED）
+            #                                         → 绑定/加密链路坏了，
+            #                                           按语音键按到天荒地老也没用，
+            #                                           必须删设备重新配对（或重启电脑）
+            #   这条探针 60 秒最多跑一次，不打扰重连节奏。
+            truth = getattr(self, "_truth", None)
+            if len(uuids) <= 4 and (time.time() - float(
+                    getattr(self, "_truth_at", 0.0))) > 60.0:
+                self._truth_at = time.time()
+                fresh = await gatt_truth(self.addr)
+                if fresh:
+                    truth = self._truth = fresh
+            atvv_denied = bool(truth and truth.get("atvv") == "DENIED")
+            if atvv_denied:
+                self.note = i18n.L(
+                    "ATVV 被 Windows 拒绝（ACCESS_DENIED）—— 不是遥控器睡着，"
+                    "要在设置里删掉设备重新配对",
+                    "ATVV is blocked by Windows (ACCESS_DENIED) — the remote is not "
+                    "asleep; remove it in Settings and pair it again")
+            else:
+                # ★ 2026-11-14：这条分支以前**从不设置 self.note**，于是界面一直显示
+                #   `未启动`（__init__ 的初值）—— 用户看到"就绪 / 未启动"，以为语音
+                #   没开，其实它每 10 秒在重连。note 必须跟着真实状态走。
+                self.note = i18n.L(
+                    "只看到 4 个基础服务（ATVV 不在）—— 按住语音键 2 秒叫醒它，"
+                    "一直不行就点「重置蓝牙电台」",
+                    "Only the 4 basic services are exposed (no ATVV) — hold the VOICE key for "
+                    "2 seconds to wake the remote; if it keeps failing, use "
+                    "“Reset Bluetooth radio”")
             # ★ 计入"卡住"计数（2026-11-06 修正）：这条路径以前从不增加 _stuck，
             #   导致 _maybe_unstick 永远触发不了，只能无限重连。
             self._stuck = getattr(self, "_stuck", 0) + 1
             self._log(f"语音：缺少 ATVV 特征（本次枚举到 {len(uuids)} 个服务："
                       f"{', '.join(uuids) or '空'}）")
-            if self.misses >= 3:
+            if atvv_denied:
+                # 这一行是"一看就知道怎么处理"的那种日志：先说清谁在拒绝，
+                # 再说清按键为什么没用，最后给一条能走通的路。
+                self._log(i18n.L(
+                    f"语音：Windows 说这台遥控器有 {truth['total']} 个服务，"
+                    f"但 ATVV(ab5e0001) 被拒绝访问（ACCESS_DENIED）；"
+                    f"能访问的只有 {', '.join(truth['ok']) or '无'}。"
+                    "这不是遥控器在睡觉 —— 它醒着，按键都正常 —— 是蓝牙的"
+                    "绑定/加密链路坏了，按语音键叫不醒它。"
+                    "修法：设置 → 蓝牙和其他设备 → 删除「Chromecast Remote」，"
+                    "再按住【返回 + 主页】重新配对；或者先重启一次电脑试试。",
+                    f"Voice: Windows lists {truth['total']} services on this remote, but "
+                    f"ATVV(ab5e0001) is ACCESS_DENIED (accessible: "
+                    f"{', '.join(truth['ok']) or 'none'}). The remote is awake — the "
+                    "Bluetooth bonding/encryption link is broken, so pressing the VOICE "
+                    "key cannot help. Fix: Settings > Bluetooth & devices > remove "
+                    "“Chromecast Remote”, then hold BACK + HOME to pair it again "
+                    "(or reboot once first)."))
+            if self.misses >= 3 and not atvv_denied:
                 self._log("语音：连续 3 次看不到 ATVV —— 蓝牙通道被占住，"
                           "正在自动释放通道并重试（不用重启客户端）")
-            if self._stuck >= 3:
+            if self._stuck >= 3 and not atvv_denied:
                 # 走到这里说明"自己关也关不干净"：Windows 的 HID 驱动攥着那条唯一
                 # 的连接，只有关开蓝牙电台才能把它松掉。_maybe_unstick 自带 10 分钟
                 # 限流，不会反复折腾用户的其他蓝牙设备。
+                # ★ 2026-11-14：ATVV 被 ACCESS_DENIED 时**绝不能**关开电台 ——
+                #   电台一关一开，链路重新握手，绑定/加密状态只会更糟。
+                #   本机 09:14 那次自动关开之后，ATVV 就再没回来过（见日志 09:13→09:23）。
                 await self._maybe_unstick()
                 self.misses = 0     # 解卡后重新开始计静置周期，避免 misses 一路涨到
                                     # 超过 6 之后 _close_current 的静置永久失效。
-            if self.misses >= 2 and not getattr(self, "_variant_hinted", False):
+            if (not atvv_denied) and self.misses >= 2 and not getattr(self, "_variant_hinted", False):
                 # ★ 2026-11-09 修正文案（原说法是"这台遥控器没有语音服务、换遥控器"）。
                 #   实测（_dual_check / _svc_hint_check，2026-11-09 11:36~11:37）：
                 #   bleak 只认到 4 个基础服务、按 UUID 请求 ATVV 返回 0 个，
@@ -1753,7 +1857,7 @@ class VoiceRole(threading.Thread):
             #   现在只提示；按键一到 poke() 会立刻重连（这是唯一真正能叫醒它的通道）。
             try:
                 self._four_streak = getattr(self, "_four_streak", 0) + 1
-                if self._four_streak >= 2:
+                if self._four_streak >= 2 and not atvv_denied:
                     self._wake_hint(i18n.L("遥控器只剩 4 个基础服务（ATVV 不在）",
                                            "the remote exposes only the 4 basic services (no ATVV)"))
             except Exception as _e2:
