@@ -153,6 +153,50 @@ bleak 3.0.2 的 winrt 后端 `_get_services()` 里有一句
 因此 `voice.py` 里那句话改成实测有效的顺序：电池取下 10 秒 → 重启电脑 → 仍不行再删设备重配。
 （本轮只改 `voice.py` 文案与 `web/index.html`，两个 exe 不含这两个文件，**不用重打**。）
 
+### 九、控制台窗口「满屏没按钮」+「最小化就消失」—— 决定权被交给了 Maxthon
+
+用户原话两条：**「遥控器控制台占了我的满屏，没有办法最小化、也没办法关闭」**、
+**「用最小化它会关闭，正常最小化应该在任务栏里，应该有小窗、有图标」**，
+并且「两种显示形式是随机出现的：一种满屏、鼠标移上去出现叉叉；一种是浏览器形式、最小化就彻底退出」。
+
+现场证据（`probe_console_window.py` / `probe_console_style.py`，只读）：
+
+| 事实 | 数值 |
+| --- | --- |
+| 窗口是谁开的 | **Maxthon**（`pid=39968`），不是默认浏览器 Edge（`UserChoice=MSEdgeHTM`） |
+| 落在哪块屏 | `\\.\DISPLAY2`（2560x1440 @ (-2560,-235)），主屏 1920x1200 @ (0,0) |
+| 最小化后 | `rect=(-21333,-21333)`，仍"属于" DISPLAY2 → 主屏任务栏没有它的按钮 |
+| 任务栏多屏 | `MMTaskbarEnabled / MMTaskbarMode` 均未设置（默认只在主屏显示按钮） |
+
+根因：`app.py` 三处入口都是 `os.startfile(url)` —— 把地址丢给"系统默认浏览器"，
+**窗口形态的决定权交给了第三方**（Maxthon 自己的全屏/独立窗口/最小化到托盘设置随机生效）。
+
+修复：新增 `open_console(url)`，三处入口全改走它。
+
+1. 优先用 Chromium（Edge → Chrome）`--app=<url>` 开**普通应用窗口**（系统标题栏/最小化/关闭），
+   带 `--window-size=1400,950 --window-position=<主屏居中>`；
+2. **Win32 兜底** `_fit_console_window()`：按"标题 + 本次新出现"认窗口，rect 不在主屏或
+   超过工作区 92% 就 `ShowWindow(SW_RESTORE)` + `SetWindowPos` 调成目标矩形；
+3. 机器上没有 Chromium 才回退 `os.startfile` / `webbrowser`。
+
+实测踩到的坑：这台机器上 Edge 已在跑，带 `--app=… --user-data-dir=<新目录>` 启动时
+**命令行被转发给已有实例**（新目录没创建、没有新进程），窗口尺寸是它自己记的 945x1132
+（高 1132 / 工作区 1152 = 98%，看着还是满屏）。所以尺寸必须事后 `SetWindowPos`，
+**窗口 pid 也不是 Popen 的那个** —— 认窗口只能靠"标题 + 新出现"。
+
+验收：
+
+| 项目 | 结果 |
+| --- | --- |
+| 打开者 | `msedge.exe`（不再是 Maxthon） |
+| 所在屏 | `\\.\DISPLAY1`（主屏） |
+| 尺寸/位置 | `(260,67) 1400x950`（工作区 1920x1152） |
+| 样式位 | 标题栏/可缩放/最小化/最大化/系统菜单 全 True，`WS_EX_TOOLWINDOW=False` |
+| 最小化 | `IsWindow=True`、`IsIconic=True`、无属主 → 任务栏有按钮；还原后 rect 一致 |
+| 自动纠正 | 首次 945x1132 被改成 1400x950，日志有据 |
+
+（`app.py` 是**磁盘上的文件**，随 `_sync_deploy.py` 同步；重启客户端即生效，不用重打 exe。）
+
 ## v1.3.1（2026-11-13）—— 装进 `C:\Program Files` 后「语音不行」的根因修复
 
 用户反馈原话：**「语音不行 其余都ok」**，`/api/state` 里 `voice.note` =
