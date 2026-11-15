@@ -203,6 +203,26 @@ bleak 3.0.2 的 winrt 后端 `_get_services()` 里有一句
 
 （`app.py` 是**磁盘上的文件**，随 `_sync_deploy.py` 同步；重启客户端即生效，不用重打 exe。）
 
+### 十、重新打包时抓到：安装包里 `_uninstall_info.json` 的版本号写死成 1.3.1
+
+- **现象**：发布前的最后一道闸 `_test_install_e2e.py` 报 `✗ _uninstall_info.json 版本是 1.3.1`，
+  实际写出来的是 **1.3.2**（装好的副本、界面、PE 版本信息全是 1.3.2）。
+- **两个根因，一个真一个假**：
+  1. **真的**：`setup_wizard.write_uninstall_info()` 的**默认参数**还停在 `version="1.3.1"`。
+     正常安装路径会显式传 `self.APP_VERSION`，所以只有"不带参数调用"时才暴露
+     （测试、脚本、以后新增的调用点）—— 但这是颗定时炸弹：卸载列表里会显示错版本。
+  2. **假的**：e2e 脚本自己把期望值写死成 `"1.3.1"` —— 每升一版就"假失败"一次，
+     真出问题时反而没人信这个红叉。
+- **修法**：`setup_wizard.py` 里版本只留**一个真源** `WIZARD_VERSION = "1.3.2"`
+  （`InstallerApp.APP_VERSION = WIZARD_VERSION`，`write_uninstall_info(version=None)` 时回落到它；
+  升版本只改这一行，并与 `app.py` 的 `APP_VERSION` 保持一致）；
+  e2e 改成拿 `W.InstallerApp.APP_VERSION` 当期望值。
+- **验收**：`_test_install_e2e.py` 全绿（`_uninstall_info.json 版本 = 向导 APP_VERSION(1.3.2) 1.3.2`），
+  装好的副本 `--selftest` rc=0。
+- **通用教训**：**"默认参数里的常量"和"类属性里的常量"是两份数据，迟早对不上。**
+  版本号、路径、端口这类"全局唯一值"只许有一个定义，其它地方一律引用；
+  测试里的期望值也一样 —— 写死就是给自己埋一个"下次一定红"的假警报。
+
 ## v1.3.1（2026-11-13）—— 装进 `C:\Program Files` 后「语音不行」的根因修复
 
 用户反馈原话：**「语音不行 其余都ok」**，`/api/state` 里 `voice.note` =

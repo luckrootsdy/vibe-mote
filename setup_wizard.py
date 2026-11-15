@@ -307,9 +307,16 @@ def grant_users_modify(dst_root):
         return False, f"{type(e).__name__}: {e}"
 
 
-def write_uninstall_info(dst_root, app_name="VibeMote 遥控器", version="1.3.1"):
-    info = {"app_name": app_name, "version": version, "install_dir": dst_root,
-            "installed_files": []}
+# ★ 版本号只有一个真源（2026-11-15 踩过）：这里写死过一次 "1.3.1"，
+#   而 InstallerApp.APP_VERSION 已经升到 1.3.2 —— 结果 `_uninstall_info.json`
+#   里记的版本永远是旧的（卸载列表里显示错版本），而且发布前那道 e2e 闸门
+#   也跟着"假失败"。**升版本时只改这一行**（和 app.py 的 APP_VERSION 保持一致）。
+WIZARD_VERSION = "1.3.2"
+
+
+def write_uninstall_info(dst_root, app_name="VibeMote 遥控器", version=None):
+    info = {"app_name": app_name, "version": version or WIZARD_VERSION,
+            "install_dir": dst_root, "installed_files": []}
     for dp, dn, fn in os.walk(dst_root):
         for f in fn:
             fp = os.path.join(dp, f)
@@ -325,7 +332,7 @@ def write_uninstall_info(dst_root, app_name="VibeMote 遥控器", version="1.3.1
 # ---------------------------------------------------------------------------
 class InstallerApp:
     APP_NAME = "VibeMote 遥控器"
-    APP_VERSION = "1.3.2"
+    APP_VERSION = WIZARD_VERSION
     PUBLISHER = "VibeMote"
 
     def __init__(self, root):
