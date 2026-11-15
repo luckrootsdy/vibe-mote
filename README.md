@@ -8,12 +8,11 @@
 
 **下载 → 解压 → 双击 `启动遥控器.vbs`**，没有第四步（离线包自带 Python，目标机器不需要装任何东西）。
 
-> ⬇️ **[下载最新版](releases/latest)**
-> · `VibeMote_Setup.exe`（**安装向导，约 203MB 数据**：自带 Python 运行时 + 虚拟声卡原文件，
->   干净电脑双击装完就能用 ← **最省事，推荐**）
-> · `vibe-mote-offline-v1.zip`（约 61MB，**自带 Python + 完整功能**，解压就能跑）
-> · `vibe-mote-offline-voice-v1.zip`（约 14MB，**只语音、不含 frida** ← 怕杀软 / 公司电脑选它）
-> · `vibe-mote-v1.zip`（约 900KB，目标机器已装 Python 3.10+ 时用）
+> ⬇️ **[下载最新版](releases/latest)** —— 附件是 `VibeMote_Setup_win64_v1.3.2.zip`（89 MB 压缩，
+> 解开约 200 MB）：**解压 → 双击里面的 `VibeMote_Setup.exe`**，一次 UAC 装到
+> `C:\Program Files\VibeMote 遥控器`（自带 Python 运行时 + 虚拟声卡原文件，**目标机不用装 Python、不用联网**）。
+> 装完**重启一次电脑**，桌面点「启动遥控器」。
+> · 只要语音、不想让 frida 进系统 → 看下面「路线 A~D」自己攒轻量包（仓库不提供预打包下载）
 > 更新日志 → [`CHANGELOG.md`](CHANGELOG.md) ·
 > 让 AI 帮你装 → 把仓库地址和 [`AGENTS.md`](AGENTS.md) 一起丢给它
 
