@@ -793,7 +793,7 @@ def ensure_single_instance():
 #   而 InstallerApp.APP_VERSION 已经升到 1.3.2 —— 结果 `_uninstall_info.json`
 #   里记的版本永远是旧的（卸载列表里显示错版本），而且发布前那道 e2e 闸门
 #   也跟着"假失败"。**升版本时只改这一行**（和 app.py 的 APP_VERSION 保持一致）。
-WIZARD_VERSION = "1.3.5"
+WIZARD_VERSION = "1.3.6"
 
 
 def write_uninstall_info(dst_root, app_name="VibeMote 遥控器", version=None):

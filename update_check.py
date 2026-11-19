@@ -26,9 +26,23 @@ STATE = os.path.join(HERE, "_update_state.json")
 REPO = "luckrootsdy/vibe-mote"
 API_LATEST = "https://api.github.com/repos/%s/releases/latest" % REPO
 RELEASES_PAGE = "https://github.com/%s/releases" % REPO
-TIMEOUT = 6           # 单次联网超时（秒）—— 后台线程里，6 秒足够也不算久
+RELEASES_LATEST_PAGE = "https://github.com/%s/releases/latest" % REPO
+TIMEOUT = 6           # 单个通道超时（秒）—— 后台线程里，6 秒足够也不算久
 TTL = 6 * 3600        # 缓存有效期（秒）；进程启动时仍强制联网刷新一次
 UA = "VibeMote-UpdateCheck/1.0"
+
+# ★ 2026-11-19：多通道。国内直连 GitHub 常常不通，任一通道成功即可；全失败才静默。
+#   顺序：官方 API（直连/系统代理）→ 官方 releases/latest 页 HTML 兜底 → 公开镜像 API。
+#   镜像地址是公开代理服务，可能失效 —— 所以只当作"尽力而为"的兜底，
+#   每个通道独立超时，任何一个坏掉都不会拖垮整轮检查。
+API_PATH = "/repos/%s/releases/latest" % REPO
+CHANNELS = [
+    ("api", "https://api.github.com" + API_PATH, "json"),
+    ("page", RELEASES_LATEST_PAGE, "html"),
+    ("mirror-ghproxy", "https://ghproxy.net/https://api.github.com" + API_PATH, "json"),
+    ("mirror-ghproxy2", "https://ghproxy.io/https://api.github.com" + API_PATH, "json"),
+    ("mirror-fastgit", "https://hub.fastgit.xyz/https://api.github.com" + API_PATH, "json"),
+]
 
 
 def _ver_tuple(s):
@@ -109,28 +123,55 @@ def _opener(proxy):
     return urllib.request.build_opener(h)
 
 
+def _parse_json(body):
+    data = json.loads(body.decode("utf-8", "replace"))
+    tag = str(data.get("tag_name") or "").strip()
+    if not _ver_tuple(tag):
+        return None
+    return {"ok": True, "latest": tag.lstrip("vV"), "tag": tag,
+            "page": str(data.get("html_url") or RELEASES_PAGE),
+            "published": str(data.get("published_at") or "")}
+
+
+def _parse_html(body, final_url):
+    """releases/latest 会 302 到 /releases/tag/vX.Y.Z；从 URL 或页面里抓 tag。"""
+    text = body.decode("utf-8", "replace")
+    m = re.search(r"/releases/tag/(v?\d+(?:\.\d+){0,3})", str(final_url or ""))
+    if not m:
+        m = re.search(r"/releases/tag/(v?\d+(?:\.\d+){0,3})", text)
+    if not m:
+        m = re.search(r'"tagName":"(v?\d+(?:\.\d+){0,3})"', text)
+    if not m or not _ver_tuple(m.group(1)):
+        return None
+    tag = m.group(1)
+    return {"ok": True, "latest": tag.lstrip("vV"), "tag": tag,
+            "page": "%s/tag/%s" % (RELEASES_PAGE, tag), "published": ""}
+
+
 def fetch_latest():
-    """联网查最新稳定版。返回 dict：ok / latest / tag / page / published / error。"""
-    req = urllib.request.Request(
-        API_LATEST, headers={"User-Agent": UA,
-                             "Accept": "application/vnd.github+json"})
-    try:
-        with _opener(_proxy_string()).open(req, timeout=TIMEOUT) as r:
-            data = json.loads(r.read().decode("utf-8", "replace"))
-        if not isinstance(data, dict):
-            return {"ok": False, "error": "bad response"}
-        tag = str(data.get("tag_name") or "").strip()
-        if not _ver_tuple(tag):
-            return {"ok": False, "error": "bad tag: %s" % tag}
-        return {"ok": True,
-                "latest": tag.lstrip("vV"),
-                "tag": tag,
-                "page": str(data.get("html_url") or RELEASES_PAGE),
-                "published": str(data.get("published_at") or "")}
-    except urllib.error.HTTPError as e:
-        return {"ok": False, "error": "HTTP %s" % e.code}
-    except Exception as e:
-        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+    """多通道查最新稳定版。任一通道成功即返回，全失败返回 ok=False（静默）。"""
+    proxy = _proxy_string()
+    opener = _opener(proxy)
+    errors = []
+    for name, url, kind in CHANNELS:
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": UA,
+                              "Accept": "application/vnd.github+json"})
+            with opener.open(req, timeout=TIMEOUT) as r:
+                body = r.read()
+                final = r.geturl()
+            result = (_parse_json(body) if kind == "json"
+                      else _parse_html(body, final))
+            if result:
+                result["via"] = name
+                return result
+            errors.append("%s:no-tag" % name)
+        except urllib.error.HTTPError as e:
+            errors.append("%s:HTTP%s" % (name, e.code))
+        except Exception as e:
+            errors.append("%s:%s" % (name, type(e).__name__))
+    return {"ok": False, "error": "; ".join(errors)}
 
 
 def check(current, force=False):
@@ -145,7 +186,8 @@ def check(current, force=False):
         net = fetch_latest()
         if net.get("ok"):
             result = {"ok": True, "latest": net["latest"], "tag": net["tag"],
-                      "page": net["page"], "published": net.get("published", "")}
+                      "page": net["page"], "published": net.get("published", ""),
+                      "via": net.get("via")}
             st["result"] = result
             st["checked_at"] = now
             _write_state(st)

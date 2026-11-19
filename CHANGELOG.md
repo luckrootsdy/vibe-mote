@@ -1,9 +1,10 @@
 # 更新日志
 
-## v1.3.5 补充（2026-11-19）—— 松手延时可调 + 打开自动查新版本
+## v1.3.6（2026-11-19）—— 松手延时可调 + 打开自动查新版本 + 多通道重试
 
 - **松手延时可调节**：`voice.tail_ms` 默认值由 1500ms 改为 **500ms**；在控制台「语音」页新增「松手延时（毫秒）」数字输入框（0~5000ms，0=松手立即结束、不延迟），保存即热生效（无需重启）。前端 `normalizeConfig` 原先只保留 mode/key/mods，会把 tail_ms/worker/auto_unstick 等字段在保存时抹掉，已改为先整包带回后端字段再覆盖。
 - **打开自动检查新版本**：新增 `update_check.py`（纯标准库），每次启动在后台线程查 GitHub Releases（`luckrootsdy/vibe-mote`），有新版本就在控制台弹「发现新版本」浮层（当前→最新 + 去下载 + 重新检查 + 忽略此版本）。结果缓存在 `_update_state.json`（不写 config.json，避免被界面保存抹掉）；忽略的版本记忆到出更新版本前不再提示。无网/代理/GitHub 不通一律静默失败，绝不影响正常使用。新增 `GET /api/update` 与 action `check-update`/`dismiss-update`。
+- **多通道查新**：`fetch_latest()` 依次尝试 ① 官方 API ② releases/latest 页 HTML 兜底 ③ 若干 ghproxy 镜像，每个通道独立 6s 超时，任一成功即返回（`via` 字段记录命中通道），全失败才静默——国内直连 GitHub 常不通，不能硬依赖单一通道。
 - 新增文件：`update_check.py`；改动：`app.py`、`web/index.html`。所有测试通过。
 
 ## v1.3.5（2026-11-19）—— 语音状态机加固：断线复位 / 尾音保持 / 重连串行化
