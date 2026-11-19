@@ -602,6 +602,22 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
           <div class="hint" id="setupHint"></div>
         </div>
 
+        <!-- 遥控器配对：Windows 里设备被删掉 / 换了电脑 / 指示灯不闪时，先按这里重新配对。
+             口诀由用户指定，不要改写（返回+主页 约 3 秒 → 指示灯快闪 → 松手）。 -->
+        <div class="card" id="pairCard">
+          <div class="card-title" data-i18n="pair.title">遥控器配对不上？</div>
+          <p class="note" data-i18n="pair.why">遥控器在 Windows 里被删掉（或换了电脑）之后，必须重新配对一次，按键和语音才能用。</p>
+          <p class="note" style="margin-top:12px">
+            <strong data-i18n="pair.step1k">第 1 步 · 让遥控器进入配对模式</strong><br>
+            <span data-i18n="pair.step1">同时按住【返回 ←】和【主页 ⌂】两个键，约 3 秒，直到遥控器指示灯快速闪烁再松手。</span>
+          </p>
+          <p class="note" style="margin-top:12px">
+            <strong data-i18n="pair.step2k">第 2 步 · 在电脑上添加设备</strong><br>
+            <span data-i18n="pair.step2">设置 → 蓝牙和其他设备 → 添加设备 → 蓝牙 → 在列表里选「Chromecast Remote」。</span>
+          </p>
+          <div class="hint" data-i18n="pair.tip">配对模式大约 1 分钟就超时：列表里看不到「Chromecast Remote」就重按第 1 步再来一次（先确认电池还有电）。</div>
+        </div>
+
         <div class="card">
           <div class="card-title" data-i18n="card.state">运行状态</div>
           <div class="rows" id="stateRows">
@@ -1212,6 +1228,14 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'setup.qwen': '千问「允许注入」',
       'setup.boot': '开机自启',
       'setup.uac': '一键优化（免 UAC）',
+      // ── 遥控器配对（首页卡片）：用户指定口诀，勿改写 ──
+      'pair.title': '遥控器配对不上？',
+      'pair.why': '遥控器在 Windows 里被删掉（或换了电脑）之后，必须重新配对一次，按键和语音才能用。',
+      'pair.step1k': '第 1 步 · 让遥控器进入配对模式',
+      'pair.step1': '同时按住【返回 ←】和【主页 ⌂】两个键，约 3 秒，直到遥控器指示灯快速闪烁再松手。',
+      'pair.step2k': '第 2 步 · 在电脑上添加设备',
+      'pair.step2': '设置 → 蓝牙和其他设备 → 添加设备 → 蓝牙 → 在列表里选「Chromecast Remote」。',
+      'pair.tip': '配对模式大约 1 分钟就超时：列表里看不到「Chromecast Remote」就重按第 1 步再来一次（先确认电池还有电）。',
       'qwen.noIme': '本机没有检测到千问输入法 —— 这个开关不需要，用别的输入法看「使用说明」。',
       'qwen.on': '千问「允许注入」已打开 ✓（首次启动时自动打开的）。若语音键在千问里没反应，可点右边按钮重新打开一次。',
       'qwen.optout': '千问「允许注入」是关的 —— 你之前在「清理」里明确删过它，所以程序不再自动打开。想恢复就点右边按钮。',
@@ -1612,6 +1636,14 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'setup.qwen': 'Qianwen “allow injection”',
       'setup.boot': 'Launch at startup',
       'setup.uac': 'One-click optimization (no more UAC)',
+      // ── Remote pairing (home card): wording is user-specified, do not rewrite ──
+      'pair.title': 'Remote will not pair?',
+      'pair.why': 'After the remote was removed in Windows (or you moved to another PC), you must pair it once more before keys and voice work.',
+      'pair.step1k': 'Step 1 · Put the remote into pairing mode',
+      'pair.step1': 'Hold the [Back ←] and [Home ⌂] buttons together for about 3 seconds, until the remote LED blinks fast, then release.',
+      'pair.step2k': 'Step 2 · Add the device on this PC',
+      'pair.step2': 'Settings → Bluetooth & devices → Add device → Bluetooth → pick "Chromecast Remote" in the list.',
+      'pair.tip': 'Pairing mode times out after about 1 minute: if "Chromecast Remote" does not show up, repeat step 1 (check the batteries first).',
       'qwen.noIme': 'Qianwen IME was not found on this PC — this switch is not needed; for other IMEs see "Usage".',
       'qwen.on': 'Qianwen "Allow injection" is ON ✓ (enabled automatically on first launch). If the voice key does nothing in Qianwen, click the button to enable it again.',
       'qwen.optout': 'Qianwen "Allow injection" is OFF — you removed it explicitly under Cleanup, so the app no longer enables it automatically. Click the button to restore it.',
@@ -2508,7 +2540,9 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       case 'combo':
         list = mods.concat(m.value ? [v] : []);
         return list.length ? list.join('+') : '—';
-      case 'hold': return t('map.hold', v);
+      case 'hold':
+        list = mods.concat(m.value ? [v] : []);
+        return t('map.hold', list.length ? list.join('+') : '—');
       case 'holdcombo':
         list = mods.concat(m.value ? [v] : []);
         return t('map.hold', list.length ? list.join('+') : '—');

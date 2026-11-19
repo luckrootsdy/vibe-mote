@@ -38,7 +38,9 @@ r.poke()
 time.sleep(6.0)                 # 够看到：1 次退出 + 立刻重建 + 第 2 次退出 + 进入退避
 
 spawns = [m for m in logs if "已启动（pid" in m]
-late = [m for m in logs if "退避" in m]
+# ★ 2026-11-17：poke 那条日志写的是「打断退避，立刻重建连接进程」——它含"退避"
+#   但不是退避判定，原来会把 late 数成 2、让这个测试永远失败。这里排掉它。
+late = [m for m in logs if "退避" in m and "打断退避" not in m]
 fresh = [m for m in logs if "换一个新进程重置服务快照" in m]
 poke_ok = [m for m in logs if "收到 poke" in m]
 

@@ -54,8 +54,17 @@ class FakeRole:
 
 voice.VoiceRole = FakeRole
 # judge() 的默认参数在 def 时就绑定了 45 秒 —— 这里包一层换成 1.5 秒。
+# ★ 2026-11-17：judge() 新增了 denied_at/denied_hits 关键字参数，包装层必须
+#   用 **kw 原样转发，否则真跑 main() 时会 TypeError（这个测试抓到过一次）。
 _judge = voice_worker.judge
-voice_worker.judge = lambda now, c, fa, fh, ds: _judge(now, c, fa, fh, ds, connect_fail=1.5)
+
+
+def _fast_judge(now, c, fa, fh, ds, **kw):
+    kw["connect_fail"] = 1.5
+    return _judge(now, c, fa, fh, ds, **kw)
+
+
+voice_worker.judge = _fast_judge
 
 blob = base64.b64encode(json.dumps(
     {"addr": "00:00:00:00:00:00", "audio": {}, "voice": {}, "relay": False}
