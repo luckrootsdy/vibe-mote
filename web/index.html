@@ -474,6 +474,14 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
 .toast.bad{border-color:var(--bad-6);background:var(--bad-3);color:var(--bad-12)}
 @keyframes toastin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 
+/* 新版本提示浮层（全局固定，任何页面都能看到；可关掉） */
+.upd-banner{position:fixed;right:18px;bottom:18px;z-index:60;max-width:min(400px,90vw);border:1px solid var(--warn-6);background:var(--elevated);border-radius:var(--radius);padding:14px 16px;box-shadow:var(--shadow-2);animation:toastin .2s ease}
+.upd-banner .upd-t{font-size:13.5px;font-weight:600;color:var(--fg);display:flex;align-items:center;gap:8px}
+.upd-banner .upd-t .dot{width:8px;height:8px;border-radius:50%;background:var(--warn-6);flex:0 0 auto}
+.upd-banner .upd-d{font-size:12.2px;color:var(--muted);margin-top:6px;line-height:1.55;word-break:break-word}
+.upd-banner .upd-a{display:flex;gap:8px;margin-top:11px;flex-wrap:wrap}
+.upd-banner .upd-x{position:absolute;top:6px;right:9px;font-size:17px;line-height:1;color:var(--muted-2);cursor:pointer;border:0;background:none;padding:2px 5px}
+
 /* ===================== 语言切换（顶部，主题开关旁边那一类） ===================== */
 .topbar-right{display:flex;align-items:center;gap:10px;margin-left:auto;min-width:0}
 .lang-switch{
@@ -906,6 +914,14 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
             <div class="hint" id="voiceTip"></div>
           </div>
 
+          <div class="field">
+            <label for="voiceTail" data-i18n="voice.tail">松手延时（毫秒）</label>
+            <div class="row">
+              <input type="number" id="voiceTail" class="inline-input" min="0" max="5000" step="50" value="500">
+            </div>
+            <div class="hint" data-i18n="voice.tailHint">松开语音键后继续按住快捷键的时间，用来补收还在管道里的结尾音频。0 = 松手立刻结束（不延迟）；一般 300~800 毫秒，太大结尾会拖尾。保存后立即生效，无需重启。</div>
+          </div>
+
           <div class="row" style="margin-top:16px">
             <button class="btn primary" type="button" id="btnSaveVoice" data-i18n="voice.save">保存语音设置</button>
             <button class="btn" type="button" id="btnTestVoice" data-i18n="voice.test">测试发键</button>
@@ -1065,6 +1081,18 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
 </div>
 
 <div class="toast-wrap" id="toastWrap"></div>
+
+<!-- 新版本提示浮层：启动时自动检查 GitHub，有新版就显示（全局固定，可关/可忽略） -->
+<div class="upd-banner" id="updateBanner" hidden>
+  <button class="upd-x" type="button" id="updateClose" title="关闭">×</button>
+  <div class="upd-t"><span class="dot"></span><span data-i18n="upd.title">发现新版本</span></div>
+  <div class="upd-d" id="updateDesc"></div>
+  <div class="upd-a">
+    <a class="btn primary" id="updateDownload" href="#" target="_blank" rel="noopener" data-i18n="upd.download">去下载升级</a>
+    <button class="btn" type="button" id="updateCheck" data-i18n="upd.recheck">重新检查</button>
+    <button class="btn" type="button" id="updateIgnore" data-i18n="upd.ignore">忽略此版本</button>
+  </div>
+</div>
 <input type="file" id="importFile" accept="application/json,.json" hidden>
 
 <script>
@@ -1161,6 +1189,11 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'dep.bannerTitle': '依赖不完整',
       'dep.bannerBtn': '安装依赖',
       'dep.bannerBtn2': '全部安装',
+      'upd.title': '发现新版本',
+      'upd.desc': '当前版本 v{0}，最新版本 v{1}。点「去下载升级」打开发布页，下载新的安装包覆盖安装即可（配置会保留）。',
+      'upd.download': '去下载升级',
+      'upd.recheck': '重新检查',
+      'upd.ignore': '忽略此版本',
       'dep.unknown': '未知',
       'dep.ok': '齐全',
       'dep.missing': '缺失 {0} 项',
@@ -1344,6 +1377,8 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'voice.save': '保存语音设置',
       'voice.test': '测试发键',
       'voice.qwenBtn': '打开千问「允许注入」',
+      'voice.tail': '松手延时（毫秒）',
+      'voice.tailHint': '松开语音键后继续按住快捷键的时间，用来补收还在管道里的结尾音频。0 = 松手立刻结束（不延迟）；一般 300~800 毫秒，太大结尾会拖尾。保存后立即生效，无需重启。',
       'voice.usage': '使用说明',
       'voice.usageHtml': '语音走遥控器麦克风 → 虚拟声卡。请在输入法设置里把麦克风选择为 <code>CABLE Output (VB-Audio Virtual Cable)</code>， 否则输入法收不到遥控器采到的声音。',
       'voice.keep': '保持现设置',
@@ -1569,6 +1604,11 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'dep.bannerTitle': 'Dependencies incomplete',
       'dep.bannerBtn': 'Install dependencies',
       'dep.bannerBtn2': 'Install all',
+      'upd.title': 'New version available',
+      'upd.desc': 'Current v{0}, latest v{1}. Click "Download upgrade" to open the releases page, then install the new package over the old one (your settings are kept).',
+      'upd.download': 'Download upgrade',
+      'upd.recheck': 'Check again',
+      'upd.ignore': 'Ignore this version',
       'dep.unknown': 'Unknown',
       'dep.ok': 'All present',
       'dep.missing': '{0} missing',
@@ -1752,6 +1792,8 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       'voice.save': 'Save voice settings',
       'voice.test': 'Send test key',
       'voice.qwenBtn': 'Enable Qianwen "Allow injection"',
+      'voice.tail': 'Release delay (ms)',
+      'voice.tailHint': 'How long to keep the push-to-talk key held after you release the voice key, to catch trailing audio still in the pipeline. 0 = release immediately (no delay). Usually 300-800 ms; too large makes endings drag. Takes effect as soon as you save.',
       'voice.usage': 'Usage',
       'voice.usageHtml': 'Voice goes from the remote microphone to the virtual audio cable. In your IME settings, set the microphone to <code>CABLE Output (VB-Audio Virtual Cable)</code>, otherwise the IME never receives the audio captured by the remote.',
       'voice.keep': 'Keep current setting',
@@ -1991,6 +2033,9 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
     if (state || stateTried) renderState();   // 里面有依赖横幅 / 千问状态 / 设置页联动
     var le = $('.log-empty');
     if (le) le.textContent = t('log.empty');
+    if (_updInfo && $('#updateBanner') && !$('#updateBanner').hidden) {
+      $('#updateDesc').textContent = t('upd.desc', _updInfo.current || '', _updInfo.latest || '');
+    }
   }
 
   // 告诉后端界面语言（它据此换自己发的中文/英文消息）；失败不影响界面
@@ -2152,6 +2197,52 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
   function api(path, opts) {
     var o = Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts || {});
     return fetch(path, o).then(function (r) { return r.json(); }).catch(function () { return null; });
+  }
+
+  /* ==================== 新版本提示 ====================
+     启动后自动查一次 GitHub（后端后台线程），这里只负责显示/隐藏浮层。
+     失败（无网/代理/GitHub 不通）一律静默，绝不打扰用户。 */
+  var _updInfo = null;
+  function showUpdate(info, notify) {
+    if (!info) return;
+    _updInfo = info;
+    var box = $('#updateBanner');
+    if (!box) return;
+    // 只有「有新版本」且用户没忽略才显示；其余情况（已是最新/失败/忽略）一律隐藏
+    if (!info.available || info.ignored) { box.hidden = true; return; }
+    $('#updateDesc').textContent = t('upd.desc', info.current || '', info.latest || '');
+    var link = $('#updateDownload');
+    if (link) link.href = info.page || info.releases_page || '#';
+    box.hidden = false;
+    if (notify) toast(t('upd.title') + ' v' + info.latest, false);
+  }
+  function checkUpdate(force) {
+    if (!force) {
+      // 只读缓存，快；后端启动时已在后台联网刷新过
+      return api('/api/update').then(function (info) { showUpdate(info, !!force); });
+    }
+    // 手动「重新检查」：强制联网（后端有 6 秒超时）
+    return api('/api/action', {
+      method: 'POST', body: JSON.stringify({ action: 'check-update' })
+    }).then(function (r) {
+      if (r && r.update) showUpdate(r.update, true);
+      if (r && r.msg) toast(r.msg, !!(r.ok === false));
+      return r;
+    });
+  }
+  function bindUpdate() {
+    var close = $('#updateClose');
+    if (close) close.addEventListener('click', function () { $('#updateBanner').hidden = true; });
+    var re = $('#updateCheck');
+    if (re) re.addEventListener('click', function () { checkUpdate(true); });
+    var ign = $('#updateIgnore');
+    if (ign) ign.addEventListener('click', function () {
+      var v = (_updInfo && _updInfo.latest) || '';
+      $('#updateBanner').hidden = true;
+      api('/api/action', {
+        method: 'POST', body: JSON.stringify({ action: 'dismiss-update', version: v })
+      });
+    });
   }
 
   /* ==================== 状态渲染 ==================== */
@@ -2969,11 +3060,15 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       } : { long_ms: 600, double_ms: 300 },
       voice: (function () {
         var v = r.voice || {};
-        var out = {
-          mode: v.mode || 'hold',
-          key: v.key || '',
-          mods: Array.isArray(v.mods) ? v.mods.slice() : []
-        };
+        // ★ 先把后端返回的所有字段原样带上（tail_ms松手延时 / worker / auto_unstick /
+        //   heal_mode / heal_cooldown 等），否则界面点一次保存就会把它们抹回默认。
+        var out = {};
+        Object.keys(v).forEach(function (k) { out[k] = v[k]; });
+        out.mode = v.mode || 'hold';
+        out.key = v.key || '';
+        out.mods = Array.isArray(v.mods) ? v.mods.slice() : [];
+        out.tail_ms = (typeof v.tail_ms === 'number' || typeof v.tail_ms === 'string')
+          ? (parseInt(v.tail_ms, 10) || 0) : 500;
         // ★ 语音键的「单击 / 长按 / 双击」三个子规格必须原样带回去。
         //   以前这里只保留 mode/key/mods，导致每次在页面上点保存，
         //   语音键的 tap/long/double 就被整段抹掉（现象：改完只剩一个动作）。
@@ -3006,6 +3101,9 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
     if (document.activeElement !== $('#voiceMode')) $('#voiceMode').value = config.voice.mode || 'hold';
     if (document.activeElement !== $('#voiceKey')) $('#voiceKey').value = config.voice.key || '';
     buildMods($('#voiceMods'), config.voice.mods);
+    if (document.activeElement !== $('#voiceTail')) {
+      $('#voiceTail').value = (config.voice.tail_ms != null ? config.voice.tail_ms : 500);
+    }
     // 设置页
     if (document.activeElement !== $('#remoteAddr')) $('#remoteAddr').value = config.remote_addr || '';
     var g = $('#gain');
@@ -3196,6 +3294,8 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
             configLoaded = true;
             renderConfigAll();
           }
+          // 后端后台检查完新版本会随 state 推过来 —— 不弹 toast，只更新浮层
+          if (m.state.update) showUpdate(m.state.update, false);
         }
       } else if (m.ev === 'job') {
         appendLog('[' + (m.job || 'task') + '] ' + (m.line || ''), 'job');
@@ -3321,11 +3421,13 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
         };
       }
       if (obj.voice && typeof obj.voice === 'object') {
-        var vimp = {
-          mode: obj.voice.mode || 'hold',
-          key: obj.voice.key || '',
-          mods: Array.isArray(obj.voice.mods) ? obj.voice.mods.slice() : []
-        };
+        var vimp = {};
+        Object.keys(obj.voice).forEach(function (k) { vimp[k] = obj.voice[k]; });
+        vimp.mode = obj.voice.mode || 'hold';
+        vimp.key = obj.voice.key || '';
+        vimp.mods = Array.isArray(obj.voice.mods) ? obj.voice.mods.slice() : [];
+        vimp.tail_ms = (typeof obj.voice.tail_ms === 'number' || typeof obj.voice.tail_ms === 'string')
+          ? (parseInt(obj.voice.tail_ms, 10) || 0) : 500;
         // 导入的配置里如果带了语音键三档，同样要接住，否则一导入就又丢了
         ['tap', 'long', 'double'].forEach(function (tag) {
           var s = obj.voice[tag];
@@ -3889,6 +3991,11 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       vsave.mode = $('#voiceMode').value;
       vsave.key = ($('#voiceKey').value || '').trim().toUpperCase();
       vsave.mods = readMods($('#voiceMods'));
+      // 松手延时：0=不延迟；夹紧到 0~5000ms，非法值回落到 500
+      var tv = parseInt($('#voiceTail').value, 10);
+      if (isNaN(tv) || tv < 0) tv = 0;
+      if (tv > 5000) tv = 5000;
+      vsave.tail_ms = tv;
       config.voice = vsave;
       saveConfig().then(function () { renderConfigAll(); });
     });
@@ -4092,6 +4199,8 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
     notifyLang(LANG);            // 同时告诉后端（它据此换自己发的消息）
     buildPad();
     bindUI();
+    bindUpdate();               // 新版本提示浮层的按钮（关闭/重新检查/忽略）
+    checkUpdate(false);          // 每次打开都查一次新版本（读缓存，后台线程负责联网）
     loadConfig().then(function () { loadState(); });
     loadProfiles();
     loadDelItems();

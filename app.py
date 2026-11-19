@@ -48,6 +48,9 @@ if HERE not in sys.path:
 # 中英双语：界面自己管界面上的字，后端管"要显示在界面上的消息"（见 i18n.py）。
 # 只依赖标准库，所以可以模块级导入 —— 不必像 voice/keys 那样延迟导入。
 import i18n  # noqa: E402  （必须在 sys.path 之后就位）
+# ★ 2026-11-19：在线版本检查（自动提示升级）。纯标准库、失败静默，
+#   模块级导入无副作用（真正联网只在 check() 里、且放在后台线程）。
+import update_check  # noqa: E402
 
 APP_NAME = "VibeMote"
 APP_VERSION = "1.3.5"          # 报 bug 时请带上这个版本号（界面「设置 → 界面」能看到）
@@ -357,7 +360,7 @@ DEFAULT_CONFIG = {
               #   （补收还在管道里没到的结尾音频）。判据是"还有没有新音频帧在到"，
               #   音频本来就停了就立刻抬键，所以正常情况下没有额外延迟。
               #   0 = 关掉这个行为（退回"松开立刻抬键"）。
-              "tail_ms": 1500},
+              "tail_ms": 500},
     "audio": {"gain": 4.0, "agc": True, "relay": True},
     "keys": RECOMMENDED,
 }
@@ -626,7 +629,7 @@ def save_config(cfg):
                       #   必须进白名单，否则用户点一次「保存」就被抹回默认。
                       "tail_ms": (int(v["tail_ms"])
                                   if isinstance(v.get("tail_ms"), (int, float))
-                                  else 1500)}
+                                  else 500)}
     # 语音键手势（升级功能）：长按 / 双击各配一个「点按」规格，字段形状同 voice 自己
     #   {"mode": "tap", "key": "F10", "mods": ["CTRL"]}
     # ★ 不在这里留位置，保存时会被白名单整段丢掉 —— 现象是"改完不生效，重开又回默认"，
@@ -2743,6 +2746,9 @@ def state_snapshot(cfg, roles=None):
                                  if is_bundled_runtime()
                                  else (".venv" if venv_python()
                                        else i18n.L("系统 Python", "system Python")))},
+        # ★ 2026-11-19：新版本提示信息（只读缓存，不联网）。SSE 每 5 秒推 state，
+        #   后台检查完写回缓存后前端随之更新。
+        "update": update_check.check(APP_VERSION, force=False),
         "home": HERE,          # 界面会显示它 —— 防止"跑的是另一份副本"这种事故
     }
 
@@ -3351,6 +3357,11 @@ class Handler(BaseHTTPRequestHandler):
                                "voice": cfg["voice"], "audio": cfg["audio"],
                                "gesture": cfg.get("gesture") or {},
                                "keys": cfg["keys"]})
+        if path == "/api/update":
+            # ★ 只读缓存，不联网 —— 界面每次进来都能立刻拿到"上次检查结果"。
+            #   真正的联网由启动时的后台线程做（见 main），结果写回缓存后前端
+            #   下一次轮询就会看到；手动「检查更新」按钮走 action check-update。
+            return self._json(update_check.check(APP_VERSION, force=False))
         if path == "/api/profiles":
             import profiles
             return self._json(profiles.catalog())
@@ -3817,6 +3828,24 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=lambda: (time.sleep(3.0), os._exit(0)),
                                  daemon=True).start()
             return self._json({"ok": ok, "msg": msg})
+        if act == "check-update":
+            # 手动点「检查更新」：强制联网刷新一次（有 6 秒超时，不会卡死）。
+            # 检查结果写进 update_check 自己的缓存文件，前端拿返回值即可。
+            info = update_check.check(APP_VERSION, force=True)
+            if info.get("available"):
+                msg = i18n.L(f"发现新版本 v{info.get('latest')}，当前 v{APP_VERSION}",
+                            f"New version v{info.get('latest')} available (current v{APP_VERSION})")
+            elif info.get("ok"):
+                msg = i18n.L(f"已是最新版本 v{APP_VERSION}",
+                            f"You are up to date (v{APP_VERSION})")
+            else:
+                msg = i18n.L("检查失败（无网络或连不上 GitHub），稍后再试",
+                            "Check failed (no internet or GitHub unreachable); try again later")
+            return self._json({"ok": bool(info.get("ok")), "msg": msg, "update": info})
+        if act == "dismiss-update":
+            # 用户点「暂时不 / 忽略此版本」：记住版本，直到出了更新的版本才再提示。
+            update_check.dismiss((body or {}).get("version") or "")
+            return self._json({"ok": True})
         if act == "test-voice":
             try:
                 import voice as voice_mod
@@ -4296,6 +4325,21 @@ def main():
     BUS.log(i18n.L(f"界面地址：{url}（只监听本机，外网进不来）",
                    f"UI address: {url} (listening on this machine only; not reachable "
                    f"from the network)"))
+    # ★ 2026-11-19：每次启动都在后台查一次新版本（用户要求"每次打开都检查"）。
+    #   放在后台线程 + 6 秒超时：无网 / 代理没开 / GitHub 不通都只是静默失败，
+    #   绝不拖慢界面或打断启动。结果写进 update_check 缓存，前端读 state / /api/update
+    #   就会看到并弹出提示。检查完推一条 state 事件让已打开的界面立刻刷新。
+    def _bg_update_check():
+        info = update_check.check(APP_VERSION, force=True)
+        if info.get("available"):
+            BUS.log(i18n.L(
+                f"发现新版本 v{info.get('latest')}（当前 v{APP_VERSION}）—— "
+                f"界面会提示升级：{info.get('page') or ''}",
+                f"New version v{info.get('latest')} available (current v{APP_VERSION}) "
+                f"— the UI will offer an upgrade: {info.get('page') or ''}"))
+        BUS.push({"ev": "state", "state": state_snapshot(load_config(), ROLES)})
+    threading.Thread(target=_bg_update_check, daemon=True,
+                     name="update-check").start()
     # 记下"真正在跑的是哪个 PID"（stub 的子进程）。接管/自愈脚本靠它认人。
     try:
         with open(APPPID, "w", encoding="utf-8") as f:
