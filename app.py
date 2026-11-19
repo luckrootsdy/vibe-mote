@@ -50,7 +50,7 @@ if HERE not in sys.path:
 import i18n  # noqa: E402  （必须在 sys.path 之后就位）
 
 APP_NAME = "VibeMote"
-APP_VERSION = "1.3.2"          # 报 bug 时请带上这个版本号（界面「设置 → 界面」能看到）
+APP_VERSION = "1.3.5"          # 报 bug 时请带上这个版本号（界面「设置 → 界面」能看到）
 WEB = os.path.join(HERE, "web")
 CONFIG = os.path.join(HERE, "config.json")
 REQUIREMENTS = os.path.join(HERE, "requirements.txt")
@@ -65,6 +65,7 @@ AUTOSTART_VBS = os.path.join(HERE, "启动遥控器.vbs")
 READY = os.path.join(HERE, "_ready.txt")
 # 「上次是不是正常退出」的记录：正常退出时删掉（见 main 的清理段）
 RUNSTATE = os.path.join(HERE, "_run_state.txt")
+
 # ★ 2026-11-09 小柯：真正在跑的那个进程的 PID（拿到单实例锁之后写）。
 #   为什么要它：`.venv\Scripts\pythonw.exe` 只是 py.exe 的**重定向 stub**，
 #   它会再起一个子进程 `"C:\Python312\pythonw.exe" app.py`（相对路径！），
@@ -2129,22 +2130,40 @@ ESC_GAP = 600.0          # 两次自动重启之间至少隔 10 分钟
 ESC_MAX = 3              # 一轮"连不上"里最多自动重启 3 次
 ESC_MIN_RESPAWNS = 2     # 至少已经换过 2 次 worker 进程（说明换进程这招已经用尽）
 
+# ★ 2026-11-17：ATVV 被 Windows 拒绝（ACCESS_DENIED）单独一条阶梯。
+#   为什么不能等 ESC_AFTER=180s + 换过 2 次 worker：默认配置里语音跑在**主进程线程**
+#   里（voice.worker 缺省 false），snapshot_respawns 永远是 0 → 老判据永远不成立
+#   → 用户只能自己重启客户端。真机 10:12~10:18 就是这样卡了 6 分钟。
+#   被拒这件事**换进程就能解**（10:19 重启后 2 秒连上），所以：
+#     · 连被拒 2 轮（每轮退避 ≥30 秒）且已经断了 60 秒 → 重启客户端
+#     · 依然受 ESC_GAP / ESC_MAX 限流：最多 3 次、每次隔 10 分钟，绝不重启风暴
+ESC_DENY_AFTER = 60.0    # 被 ACCESS_DENIED 且断开多久才升级
+ESC_DENY_HITS = 2        # 至少被拒 2 轮（1 轮可能只是偶发）
+
 
 def watch_escalate(down_secs, respawns, esc_count, since_last,
                    after=ESC_AFTER, gap=ESC_GAP, max_esc=ESC_MAX,
-                   min_respawns=ESC_MIN_RESPAWNS):
+                   min_respawns=ESC_MIN_RESPAWNS,
+                   denied=0, deny_after=ESC_DENY_AFTER, deny_hits=ESC_DENY_HITS):
     """要不要把整个客户端重启一次？返回 True/False。
 
     down_secs   —— 语音通道连续没连上多少秒
     respawns    —— worker 已经换过多少次进程
     esc_count   —— 这一轮"连不上"里已经自动重启过几次（**跨进程**，存在 RECOVERY_STATE）
     since_last  —— 距上次自动重启多少秒（从没重启过就传一个大数）
+    denied      —— ATVV 被 Windows 拒绝（ACCESS_DENIED）的连续轮数，0 = 没被拒
+
+    ★ 被拒时**不要求** respawns：主进程内跑语音时 respawns 恒为 0（见上面的注释），
+      而 ACCESS_DENIED 恰恰是"换进程就能解"的那一类，所以用更短的窗口直接升级。
+      其余情况（设备睡着/不在）仍然要求"换进程这招已经用尽"，避免重启风暴。
     """
     try:
         if esc_count >= max_esc:
             return False
         if since_last < gap:
             return False
+        if int(denied or 0) >= deny_hits:
+            return down_secs >= deny_after
         if respawns < min_respawns:
             return False
         return down_secs >= after
@@ -2342,6 +2361,37 @@ class Roles:
         time.sleep(0.4)
         return self.start()
 
+    def pause_voice(self):
+        """临时放开蓝牙设备（扫描用）。返回是否真的放开了。
+
+        ★ 2026-11-15 用户报「蓝牙地址找不到了，扫描也没有用了」，实测根因在这里：
+          BLE 设备**一旦被连接就不再广播**，而本客户端每 11 秒就连一次遥控器，
+          于是 6 秒的扫描窗口永远撞不上它 —— 扫出来只有几个路过的陌生设备。
+          用户以为自己把遥控器弄丢了，其实是自己的客户端把它攥在手里。
+        停掉语音角色（不动按键映射、不动进程），等 0.6 秒让句柄真正释放。
+        """
+        with self.lock:
+            old, self.voice = self.voice, None
+        if old is None:
+            return False
+        try:
+            old.stop()
+        except Exception:
+            pass
+        time.sleep(0.6)          # 给内核/蓝牙栈一点时间真正断链，否则扫不到
+        return True
+
+    def resume_voice(self):
+        """把 pause_voice() 放开的语音角色接回去（扫描结束后调用）。"""
+        with self.lock:
+            if self.voice is not None:
+                return False
+            self.voice = make_voice(self.cfg, self._on_event)
+            self.voice.start()
+            if self.keytap is not None:
+                self.keytap.on_activity = self.voice.poke
+        return True
+
     def refresh_voice(self):
         """只重建语音角色，**不动按键映射**。
 
@@ -2443,12 +2493,18 @@ class Roles:
                真机数据：11:37:42~11:46:36 那次"连不上"爆发持续 534 秒，用户按了半天
                语音键毫无反应，最后靠手动重启才回来。这条阶梯就是替代那只手的。
                限流：一轮"连不上"里最多自动重启 3 次、每次间隔 ≥10 分钟；连上就清零。
+             · ★ 2026-11-17 阶梯 ③：ATVV 被 Windows 拒绝（ACCESS_DENIED）时**不等**
+               worker 换进程次数（默认配置里语音跑在主进程线程，换进程次数恒为 0，
+               老判据永远不成立 → 只能靠用户手动重启）。被拒 2 轮、断开 60 秒就
+               重启一次客户端 —— 这是唯一实测有效的自救（10:19 重启后 2 秒连上）。
+               同样受上面的 3 次 / 10 分钟限流，绝不重启风暴。
            能叫醒遥控器的只有它自己的物理按键（HID 报文走系统蓝牙栈），软件侧
            没有通道；所以这里不假装能"叫醒设备"，只保证"它一醒我们就抓住"。
         """
         miss = 0
         last_rebuild = 0.0
         down_since = 0.0            # 「连续没连上」的起点（连上就清零）
+        capped_logged = False       # "自动重启已到上限"只提示一次，别每 5 秒刷一行
         # ★ 计数必须跨进程（RECOVERY_STATE）：自重启之后新进程还要记得"已经试过几次"，
         #   否则遥控器一直不在时会每 10 分钟重启一次客户端。
         esc_count, last_esc = read_recovery_state()
@@ -2486,6 +2542,7 @@ class Roles:
                 if connected:
                     miss = 0
                     down_since = 0.0
+                    capped_logged = False
                     if esc_count:
                         esc_count = 0
                         clear_recovery_state()
@@ -2511,20 +2568,45 @@ class Roles:
                 #    半睡/无广播）换进程不计入，否则设备真睡时会反复换进程、甚至
                 #    误触重启客户端——用户最反感的"反复启停"。
                 respawns = int(getattr(v, "snapshot_respawns", 0) or 0)
+                denied = int(getattr(v, "denied", 0) or 0)
                 since_last = (now - last_esc) if last_esc else 1e9
                 down = now - down_since
-                if watch_escalate(down, respawns, esc_count, since_last):
+                if watch_escalate(down, respawns, esc_count, since_last,
+                                  denied=denied):
                     last_esc = now
                     # 先落盘再重启：新进程要能从文件里读出"已经试过几次"。
                     write_recovery_state(esc_count + 1, now)
-                    ok = self._auto_restart_self(i18n.L(
-                        f"语音通道已经连续 {down:.0f} 秒连不上，"
-                        f"期间快照过期换过 {respawns} 次 worker 进程仍没救回来",
-                        f"the voice link has been down for {down:.0f}s and "
-                        f"{respawns} snapshot-based worker respawns did not help"))
+                    if denied >= ESC_DENY_HITS:
+                        # 被 ACCESS_DENIED 时换进程就是解药，日志要说清"这是自动的"，
+                        # 否则用户会以为又崩了。
+                        why = i18n.L(
+                            f"ATVV 被 Windows 拒绝（ACCESS_DENIED，第 {denied} 轮），"
+                            f"进程内重连救不回来 —— 换一个进程来释放独占占用",
+                            f"ATVV is ACCESS_DENIED by Windows (round {denied}); "
+                            f"reconnecting in-process cannot fix it — respawning to "
+                            f"release the exclusive claim")
+                    else:
+                        why = i18n.L(
+                            f"语音通道已经连续 {down:.0f} 秒连不上，"
+                            f"期间快照过期换过 {respawns} 次 worker 进程仍没救回来",
+                            f"the voice link has been down for {down:.0f}s and "
+                            f"{respawns} snapshot-based worker respawns did not help")
+                    ok = self._auto_restart_self(why)
                     if ok:
                         return
                     esc_count += 1
+                elif (denied >= ESC_DENY_HITS and esc_count >= ESC_MAX
+                      and not capped_logged):
+                    # 自动重启已经用满还没好 —— 别让用户对着"正在自动恢复"干等，
+                    # 明确告诉他下一步（重新配对），并说明不再重启（防风暴）。
+                    capped_logged = True
+                    BUS.log(i18n.L(
+                        f"语音看门狗：ATVV 被拒后已自动重启 {esc_count} 次（上限 {ESC_MAX}）"
+                        f"仍未恢复 —— 停止自动重启，改为持续重试。"
+                        f"请按住【返回 ←】+【主页 ⌂】3 秒重新配对遥控器。",
+                        f"Voice watchdog: auto-restarted {esc_count} time(s) (cap {ESC_MAX}) "
+                        f"after ATVV was denied and it still fails — stopping auto restarts "
+                        f"and retrying continuously. Hold BACK + HOME for 3 s to re-pair."))
             except Exception as e:
                 try:
                     BUS.log(f"语音看门狗：{type(e).__name__}: {e}")
@@ -2976,6 +3058,64 @@ def do_check(on_line):
     return 0
 
 
+def list_paired_ble():
+    """Windows 里**已配对**的 BLE 设备：[(address, name, connected)]。
+
+    ★★ 2026-11-15 用户连问三次："当初的蓝牙地址它是怎么扫出来的？最早的原始稿可以扫出来，
+       现在为什么扫不出来？" —— 查清了，**不是代码退化**：
+         · `git log -S BleakScanner` 只有 1.1.0 那一个 commit，`do_scan` 至今**一字未改**
+           （diff 结果：两者完全相同）；
+         · 变的是**设备状态**。实测（`probe_scan_truth.py`，原生 WinRT）：
+             遥控器 42:3F:6A:5D:88:16 = `connection_status: Connected`，8 个服务全能访问；
+             同一时刻广播扫描扫到 3 个路过设备，**它一个广播包都没有**。
+         · 原因就是 BLE 协议本身：**设备被连接后停止广播**。而它在这台电脑上是
+           **已配对的 HID 设备**（键盘/鼠标），Windows 的 HID 宿主（WUDFHost）一直握着连接 ——
+           连我们客户端 `stop` 之后都还是 `Connected`（实测）。所以：
+             第一版能扫到 = 那时候它**还没被 Windows 配对**，未配对设备一直在广播；
+             现在扫不到 = 配对之后由 HID 宿主持有连接，它不再对外广播。
+           Windows 自己的「添加设备」同样看不到它，这不是我们的锅。
+      结论：扫描列表里必须**先列已配对设备**（用户原话："应该把已经配对过的蓝牙放到
+      扫描里面，做一个列表，可以帮助选出来"）。扫不到的设备是"新设备"，不是"丢了的设备"。
+    """
+    try:
+        import asyncio
+        from winrt.windows.devices.bluetooth import BluetoothLEDevice, BluetoothConnectionStatus
+        from winrt.windows.devices.enumeration import DeviceInformation
+    except Exception:
+        return []
+
+    async def run():
+        sel = BluetoothLEDevice.get_device_selector_from_pairing_state(True)
+        devs = await DeviceInformation.find_all_async(sel, [])
+        out = []
+        for d in devs:
+            did = str(d.id or "")
+            # id 形如 BluetoothLE#BluetoothLE<本机适配器>-<设备地址>
+            addr = did.split("-")[-1].strip().upper()
+            if addr.count(":") != 5:
+                continue
+            name = str(d.name or "").strip()
+            connected = False
+            try:
+                dev = await BluetoothLEDevice.from_bluetooth_address_async(
+                    int(addr.replace(":", ""), 16))
+                if dev is not None:
+                    connected = dev.connection_status == BluetoothConnectionStatus.CONNECTED
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            out.append((addr, name, connected))
+        return out
+
+    try:
+        return asyncio.run(run())
+    except Exception:
+        return []
+
+
 def do_scan(on_line, on_data=None):
     try:
         import asyncio
@@ -2984,9 +3124,27 @@ def do_scan(on_line, on_data=None):
         on_line(i18n.L("缺 bleak，无法扫描。先点「安装依赖」。",
                        "bleak is missing, cannot scan. Click “Install dependencies” first."))
         return 1
-    on_line(i18n.L("扫描 6 秒……（遥控器空闲时不广播，先按一下遥控器键再扫）",
-                   "Scanning for 6 seconds… (the remote does not advertise while idle — "
-                   "press any key on it first)"))
+    items = []
+
+    # ① 先列**已配对**设备 —— 自己的遥控器几乎一定在这里。
+    #    它被 Windows 当成 HID 设备连着，连着的 BLE 设备不广播，所以广播扫描永远看不到它
+    #    （详见 list_paired_ble() 的注释；用户 2026-11-15 报"扫描没有用了"就是这个）。
+    paired = list_paired_ble()
+    if paired:
+        on_line(i18n.L(f"已配对的蓝牙设备 {len(paired)} 个（自己的遥控器在这里选）：",
+                       f"{len(paired)} paired Bluetooth device(s) — your remote is here:"))
+        for addr, name, connected in paired:
+            tag = i18n.L("已配对·已连接", "paired, connected") if connected \
+                else i18n.L("已配对", "paired")
+            label = f"{name or i18n.L('(未命名)', '(unnamed)')}（{tag}）"
+            on_line(f"  {addr}  {label}")
+            items.append({"address": addr, "name": label, "rssi": None,
+                          "paired": True, "connected": connected})
+
+    # ② 再扫附近正在广播的（= 还没配对的设备）
+    on_line(i18n.L("扫描 6 秒……（找还没配对的设备；已配对的不用扫，上面已经列出来了）",
+                   "Scanning for 6 seconds… (for devices that are not paired yet; "
+                   "paired ones are already listed above)"))
 
     async def run():
         return await BleakScanner.discover(timeout=6.0, return_adv=True)
@@ -2996,12 +3154,15 @@ def do_scan(on_line, on_data=None):
     except Exception as e:
         on_line(i18n.L(f"扫描失败 {type(e).__name__}: {e}",
                        f"Scan failed {type(e).__name__}: {e}"))
-        return 1
-    items = []
+        found = {}
+    seen = {it["address"] for it in items}
     for addr, (dev, adv) in (found or {}).items():
+        if addr.upper() in seen:
+            continue                      # 已配对列表里有了，别重复
         name = dev.name or adv.local_name or i18n.L("(未知)", "(unknown)")
         on_line(f"  {addr}  {name}  RSSI={adv.rssi}")
-        items.append({"address": addr, "name": name, "rssi": adv.rssi})
+        items.append({"address": addr, "name": name, "rssi": adv.rssi,
+                      "paired": False, "connected": False})
     if not items:
         on_line(i18n.L("没扫到设备。遥控器不按键时不广播，这是正常的。",
                        "No devices found. The remote does not advertise unless a key is pressed — "
@@ -3440,12 +3601,34 @@ class Handler(BaseHTTPRequestHandler):
                                "data": lines})
         if act == "scan":
             items = []
-            do_scan(BUS.log, items.extend)
-            msg = (i18n.L(f"扫到 {len(items)} 个蓝牙设备",
-                          f"Found {len(items)} Bluetooth device(s)") if items
-                   else i18n.L("没扫到设备（遥控器空闲时不广播，按一下它再扫）",
-                               "No devices found (the remote does not advertise while "
-                               "idle — press a button on it and scan again)"))
+            # ★ 2026-11-15 用户报「蓝牙地址找不到了，扫描也没有用了」。实测：扫描本身没坏
+            #   （能扫到 3 个路过设备），**看不到遥控器**是因为本客户端正连着它 ——
+            #   BLE 设备被连接后就不广播，而语音角色每 11 秒重连一次，
+            #   6 秒的扫描窗口永远撞不上。所以扫之前先放开设备，扫完自动接回去。
+            paused = False
+            try:
+                if ROLES is not None:
+                    paused = ROLES.pause_voice()
+                    if paused:
+                        BUS.log(i18n.L(
+                            "扫描前临时断开语音连接（连着的时候遥控器不广播，扫不到它）",
+                            "Temporarily released the voice link before scanning "
+                            "(a connected BLE device stops advertising, so it cannot be found)"))
+                do_scan(BUS.log, items.extend)
+            finally:
+                if paused:
+                    ROLES.resume_voice()
+                    BUS.log(i18n.L("扫描结束，语音连接已恢复",
+                                   "Scan finished — voice link restored"))
+            n_paired = sum(1 for it in items if it.get("paired"))
+            n_new = len(items) - n_paired
+            if items:
+                msg = i18n.L(f"已配对 {n_paired} 个，附近新设备 {n_new} 个",
+                             f"{n_paired} paired, {n_new} new nearby")
+            else:
+                msg = i18n.L("没扫到设备（遥控器空闲时不广播，按一下它再扫）",
+                             "No devices found (the remote does not advertise while "
+                             "idle — press a button on it and scan again)")
             return self._json({"ok": True, "msg": msg, "data": items})
         if act == "install-deps":
             return self._json({"ok": True, "job": background(i18n.L(
@@ -4214,9 +4397,21 @@ def main():
             except Exception:
                 up = -1.0
             rebooted = start_epoch and up >= 0 and up < (time.time() - start_epoch)
+            # ★ 2026-11-17：计划内重启（restart-app / 自动恢复 / 提权重启）走不到 main
+            #   末尾的"删 RUNSTATE"，于是新实例会把这次**计划内**的重启误报成
+            #   「上次运行没有正常退出 —— 可能是崩溃、被强杀」。日志里天天出现这种
+            #   假警报，以后真出事就没人信了。判据就用 `--takeover`：只有本软件的
+            #   restart-app / 自动恢复 / 提权重启会带它（快捷方式启动**不带**）。
+            restarted = bool(getattr(args, "takeover", False))
             if rebooted:
                 BUS.log(i18n.L("上次运行是被系统重启/关机结束的（正常）",
                                "The previous run ended with a system restart/shutdown (normal)"))
+            elif restarted:
+                BUS.log(i18n.L(
+                    f"上次运行是被本软件重启结束的（正常，记录："
+                    f"{old.replace(chr(10), ' / ')}）",
+                    f"The previous run ended with a restart by this app "
+                    f"(normal, record: {old.replace(chr(10), ' / ')})"))
             else:
                 BUS.log(i18n.L(
                     f"上次运行没有正常退出（记录：{old.replace(chr(10), ' / ')}）—— 可能是崩溃、"

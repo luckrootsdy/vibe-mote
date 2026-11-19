@@ -8,9 +8,11 @@
 
 **下载 → 解压 → 双击 `启动遥控器.vbs`**，没有第四步（离线包自带 Python，目标机器不需要装任何东西）。
 
-> ⬇️ **[下载最新版](releases/latest)** —— 附件是 `VibeMote_Setup_win64_v1.3.2.zip`（89 MB 压缩，
+> ⬇️ **[下载最新版](releases/latest)** —— 附件是 `VibeMote_Setup_win64_v1.3.5.zip`（89 MB 压缩，
 > 解开约 200 MB）：**解压 → 双击里面的 `VibeMote_Setup.exe`**，一次 UAC 装到
 > `C:\Program Files\VibeMote 遥控器`（自带 Python 运行时 + 虚拟声卡原文件，**目标机不用装 Python、不用联网**）。
+> 升级（v1.3.3 起）：会**沿用上次的安装目录**（不再默认 C 盘）、**自动结束旧实例**再覆盖，
+> 并**保留你的 `config.json`**（蓝牙地址、按键映射、语音设置）。
 > 装完**重启一次电脑**，桌面点「启动遥控器」。
 > · 只要语音、不想让 frida 进系统 → 看下面「路线 A~D」自己攒轻量包（仓库不提供预打包下载）
 > 更新日志 → [`CHANGELOG.md`](CHANGELOG.md) ·

@@ -25,8 +25,11 @@
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
+import time
 import tkinter as tk
 import winreg
 from tkinter import ttk, filedialog, messagebox
@@ -269,14 +272,70 @@ def get_special_folder(folder):
 # ---------------------------------------------------------------------------
 # 安装逻辑
 # ---------------------------------------------------------------------------
+class FileLocked(Exception):
+    """目标文件被别的进程占着，覆盖不了（典型是 WinError 32）。
+
+    为什么单独做一类异常：以前 `shutil.copy2` 抛什么就原样弹给用户，
+    界面上只有一句
+        [WinError 32] 另一个程序正在使用此文件，进程无法访问。: '...runtime\\LICENSE.txt'
+    —— 用户既不知道是**谁**占着，也不知道该关什么。现在把占用进程一起带出来。
+    """
+
+    def __init__(self, paths, procs):
+        self.paths = list(paths)
+        self.procs = list(procs)
+        names = "、".join(sorted({(f"{p[1]} (PID {p[0]})" if p[1] else f"PID {p[0]}")
+                                 for p in self.procs}))
+        if not names:
+            names = "没能识别（可能是杀软 / 索引服务在扫描）"
+        more = "" if len(self.paths) <= 3 else f" 等 {len(self.paths)} 个文件"
+        super().__init__(
+            "下面这些文件正被别的程序占用，没法覆盖：\n  "
+            + "\n  ".join(os.path.basename(p) for p in self.paths[:3]) + more
+            + "\n\n占用它的进程：" + names
+            + "\n\n处理办法：\n"
+            "  1) 先关掉上面这些程序（多半是还在运行的 VibeMote 客户端），再点“安装”；\n"
+            "  2) 还不行就重启一次电脑，然后重新双击安装包。\n"
+            "（安装向导已经自动结束过安装目录里的 VibeMote，剩下的通常是别的软件）")
+
+
+def _copy_one(src, dst):
+    """覆盖复制一个文件：先清掉只读位，失败重试几次。
+
+    ★ 为什么要重试：升级覆盖时目标文件常被"短暂"打开 —— 杀软扫描、
+      Windows 索引服务、资源管理器缩略图都会这样。实测这类占用几秒内自己就放开了，
+      直接报错等于让用户白点一次"安装"。
+    """
+    last = None
+    for attempt in range(4):
+        try:
+            if os.path.exists(dst):
+                try:
+                    os.chmod(dst, stat.S_IWRITE)   # 只读属性会让 copy2 直接 PermissionError
+                except OSError:
+                    pass
+            shutil.copy2(src, dst)
+            return
+        except PermissionError as e:
+            last = e
+            time.sleep(0.3 * (attempt + 1))
+    raise last
+
+
 def install_files(src_root, dst_root, file_list, progress_cb=None):
     total = len(file_list)
+    locked = []
     for i, (src, rel) in enumerate(file_list, 1):
         dst = os.path.join(dst_root, rel)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy2(src, dst)
+        try:
+            _copy_one(src, dst)
+        except PermissionError:
+            locked.append(dst)          # 记下来，装完统一报"谁占着"，别装到一半就弹框
         if progress_cb:
             progress_cb(i, total, rel)
+    if locked:
+        raise FileLocked(locked, locking_processes(locked))
 
 
 def grant_users_modify(dst_root):
@@ -307,11 +366,434 @@ def grant_users_modify(dst_root):
         return False, f"{type(e).__name__}: {e}"
 
 
+# ---------------------------------------------------------------------------
+# 升级覆盖安装：找到旧副本 + 停掉正在运行的那个
+#
+# ★ 2026-11-15 用户实测踩到的两个坑，这一节就是治它们的：
+#   ① **没记住上次装在哪**：原来装在 `D:\Program Files\VibeMote 遥控器`，向导却默认
+#      `C:\Program Files\VibeMote 遥控器`。根因是 `_default_install_dir()` 恒返回
+#      `%PROGRAMFILES%`，而且**安装时没往注册表写任何东西** —— "上次装在哪"这条信息
+#      根本不存在。现在：装完写 `HKCU/HKLM\Software\VibeMote\InstallDir`；启动时按
+#      注册表 → 开始菜单/桌面快捷方式 → 各盘 Program Files 扫描 依次去找。
+#   ② **旧版还在跑，覆盖就报 [WinError 32]**：卡在 `runtime\LICENSE.txt`。用户点了
+#      "停止运行"只停了语音角色，客户端进程还活着（它的解释器就是安装目录里的
+#      `runtime\pythonw.exe`）。现在安装前自动结束该目录下的实例并等它真退出；
+#      万一杀不掉，用 Restart Manager 查出"到底是谁占着这个文件"，把进程名给用户。
+# ---------------------------------------------------------------------------
+REG_KEY = r"Software\VibeMote"
+REG_VALUE = "InstallDir"
+
+# 装好之后**不能**被新版本覆盖的文件（用户自己的数据）。
+# 只有 payload 里也有的那些才需要备份 —— 目前实际只有 config.json（遥控器蓝牙地址、
+# 按键映射、语音设置都在里面，被模板覆盖 = 用户重新配一遍）。
+USER_DATA_NAMES = (
+    "config.json", "_uninstall_info.json",
+    "client.log", "_app_pid.txt", "_run_state.txt", "_ready.txt",
+    "_auto_recovery.json", "_deferred_result.txt", "_uninstall_result.json",
+    "_last_heal", ".last_heal", "uninstall.log", "elevate_setup.log",
+)
+
+
+def _reg_get(root, path, name):
+    try:
+        with winreg.OpenKey(root, path) as k:
+            return str(winreg.QueryValueEx(k, name)[0]).strip()
+    except OSError:
+        return ""
+
+
+def _reg_set(root, path, name, value):
+    try:
+        with winreg.CreateKeyEx(root, path, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, name, 0, winreg.REG_SZ, value)
+        return True
+    except OSError:
+        return False
+
+
+def remember_install_dir(dst_root):
+    """把"这次装到哪了"写进注册表，下次升级靠它记起路径。返回 (HKCU 成功, HKLM 成功)。
+
+    两个都写：HKCU 是**不需要管理员**也能写的（万一以后去掉管理员清单），
+    HKLM 是**换用户登录也还在**。读的时候先 HKCU（用户最后一次的选择最准）。
+    """
+    return (_reg_set(winreg.HKEY_CURRENT_USER, REG_KEY, REG_VALUE, dst_root),
+            _reg_set(winreg.HKEY_LOCAL_MACHINE, REG_KEY, REG_VALUE, dst_root))
+
+
+def _looks_like_install(d):
+    """这个目录是不是一份 VibeMote 安装（防止把同名空目录当成旧版本）。"""
+    if not d or not os.path.isdir(d):
+        return False
+    if not os.path.isfile(os.path.join(d, "app.py")):
+        return False
+    marks = ("runtime\\pythonw.exe", "启动遥控器.exe", "_uninstall_info.json")
+    return any(os.path.exists(os.path.join(d, m)) for m in marks)
+
+
+def read_uninstall_info(d):
+    """读安装目录里的 `_uninstall_info.json`（没有就返回 {}）。"""
+    try:
+        with open(os.path.join(d, "_uninstall_info.json"), encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _lnk_target(lnk):
+    """读一个 .lnk 的 TargetPath 和 WorkingDirectory（PowerShell + WScript.Shell）。
+
+    为什么不只认桌面快捷方式：本机实测**桌面那个不存在**，只有开始菜单里有；
+    而且用户可能自己把快捷方式挪走了。所以两个位置都看，读到哪个用哪个。
+    """
+    if not os.path.isfile(lnk):
+        return ""
+    ps = ("$s = New-Object -ComObject WScript.Shell; "
+          f"$l = $s.CreateShortcut('{_esc(lnk)}'); "
+          "$l.TargetPath + \"`n\" + $l.WorkingDirectory")
+    try:
+        r = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                            "-Command", ps],
+                           capture_output=True, timeout=25,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+    except Exception:
+        return ""
+    lines = _decode(r.stdout or b"").splitlines()
+    for line in lines:
+        line = line.strip().strip('"')
+        if line and os.path.isdir(line):
+            return line
+    return ""
+
+
+def find_previous_install():
+    r"""找"这台电脑上已经装在哪了"。返回 (目录, 来源说明)；没找到返回 ("", "")。
+
+    顺序是有讲究的：注册表最准（我们装的时候自己写的）→ 快捷方式（老版本没写注册表，
+       但快捷方式的工作目录就是安装目录）→ 磁盘扫描（连快捷方式都被删了时兜底）。
+    ★ 本机就是这么找到的：注册表里什么都没有，靠 `_uninstall_info.json` 标记扫到
+      `D:\Program Files\VibeMote 遥控器`（用户 2026-11-15 报"没记住路径"的现场）。
+    """
+    # ① 注册表：我们自己写的 + 「应用和功能」里别的安装器可能留下的 InstallLocation
+    for root, label in ((winreg.HKEY_CURRENT_USER, "HKCU"), (winreg.HKEY_LOCAL_MACHINE, "HKLM")):
+        d = _reg_get(root, REG_KEY, REG_VALUE)
+        if _looks_like_install(d):
+            return d, f"注册表 {label}\\{REG_KEY}\\{REG_VALUE}"
+    uninst = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(root, uninst) as k:
+                i = 0
+                while True:
+                    try:
+                        sub = winreg.EnumKey(k, i)
+                    except OSError:
+                        break
+                    i += 1
+                    d = _reg_get(root, uninst + "\\" + sub, "InstallLocation")
+                    if d and _looks_like_install(d):
+                        return d, f"注册表「应用和功能」\\{sub}\\InstallLocation"
+        except OSError:
+            continue
+
+    # ② 快捷方式（工作目录 / 目标所在目录）
+    links = []
+    try:
+        sm = get_special_folder("programs")
+        if sm:
+            links.append(os.path.join(sm, "VibeMote 遥控器", "启动遥控器.lnk"))
+    except Exception:
+        pass
+    try:
+        desk = get_special_folder("desktop")
+        if desk:
+            links.append(os.path.join(desk, "启动遥控器.lnk"))
+    except Exception:
+        pass
+    for lnk in links:
+        d = _lnk_target(lnk)
+        if _looks_like_install(d):
+            return d, f"快捷方式 {os.path.basename(os.path.dirname(lnk))}\\{os.path.basename(lnk)}"
+
+    # ③ 磁盘扫描：每个盘的 Program Files 及其常见变体
+    for d, label in _scan_disks_for_install():
+        return d, label
+    return "", ""
+
+
+def _scan_disks_for_install():
+    """扫各盘的 Program Files / 根目录（只扫两层，不递归整盘）。"""
+    subs = (r"Program Files\VibeMote 遥控器", r"Program Files (x86)\VibeMote 遥控器",
+            r"Program Files\VibeMote", "VibeMote 遥控器", "VibeMote")
+    try:
+        drives = [d.rstrip("\\") for d in os.listdrives()]
+    except Exception:
+        drives = [f"{c}:\\" for c in "CDEFGHIJ"]
+    for drv in drives:
+        for sub in subs:
+            d = os.path.join(drv + "\\", sub)
+            if _looks_like_install(d):
+                yield d, f"磁盘扫描 {d}"
+
+
+def _decode(raw):
+    """PowerShell 的重定向输出在中文系统上是 GBK，UTF-8 解会炸 —— 挨个试。"""
+    for enc in ("utf-8", "gbk", "mbcs"):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def _all_candidate_processes():
+    """可能属于本程序的进程：[(pid, name, exe, cmd)]。一次 WMI 查询，约 0.5~1 秒。"""
+    ps = ("Get-CimInstance Win32_Process | Where-Object { "
+          "$_.Name -match '^(python|pythonw|VibeMote|启动遥控器)' } | "
+          "Select-Object ProcessId,Name,ExecutablePath,CommandLine | ConvertTo-Json -Compress")
+    try:
+        r = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           capture_output=True, timeout=30,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+    except Exception:
+        return []
+    text = _decode(r.stdout or b"").strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except Exception:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    out = []
+    for it in data:
+        try:
+            out.append((int(it.get("ProcessId") or 0), str(it.get("Name") or ""),
+                        str(it.get("ExecutablePath") or ""), str(it.get("CommandLine") or "")))
+        except Exception:
+            continue
+    return out
+
+
+def _pid_alive(pid):
+    """进程还活着吗（不用 tasklist，避免再起一个进程 + 编码问题）。"""
+    try:
+        import ctypes
+        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))   # QUERY_LIMITED_INFO
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return code.value == 259                                   # STILL_ACTIVE
+            return True
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    except Exception:
+        return False
+
+
+def _pid_from_file(d):
+    """安装目录里 `_app_pid.txt` 记的 PID（拿锁的进程自己写的，最可靠）。"""
+    try:
+        with open(os.path.join(d, "_app_pid.txt"), encoding="utf-8") as f:
+            return int(f.read().strip().split()[0])
+    except Exception:
+        return 0
+
+
+def list_related_processes(dirs):
+    r"""属于这些安装目录的进程：[(pid, name, exe, cmd)]。
+
+    三种认人方式（缺一个就会漏掉真正占着文件的那个）：
+      ① 可执行文件在目录里 —— `runtime\pythonw.exe` 起的客户端；
+      ② 命令行里带这个目录 —— 从快捷方式/计划任务起的、cwd 不同的；
+      ③ 目录里 `_app_pid.txt` 记的 PID —— 且**必须是 python/启动器进程**才认，
+         否则 PID 被系统复用后会把无关程序杀掉。
+    """
+    dirs = [os.path.normcase(os.path.normpath(d)) for d in dirs if d]
+    if not dirs:
+        return []
+    pidfiles = {p for p in (_pid_from_file(d) for d in dirs) if p}
+    out = []
+    for pid, name, exe, cmd in _all_candidate_processes():
+        if not pid or pid == os.getpid():
+            continue
+        hit = False
+        if exe:
+            e = os.path.normcase(os.path.normpath(exe))
+            hit = any(e.startswith(d + os.sep) for d in dirs)
+        if not hit and cmd:
+            c = os.path.normcase(cmd)
+            hit = any(d in c for d in dirs)
+        if not hit and pid in pidfiles:
+            low = name.lower()
+            hit = low.startswith("python") or low.startswith("启动") or low.startswith("vibemote")
+        if hit:
+            out.append((pid, name, exe, cmd))
+    return out
+
+
+def stop_running_instances(dirs, log_cb=None):
+    """结束这些目录里的 VibeMote，并**等它们真的退出**。返回 (结束的, 还活着的)。
+
+    ★ 用户 2026-11-15 的原话："应该是自动停止原来相同的程序，然后在原来的路径上
+      覆盖安装。" 所以这里不问、不弹框，直接做；只把过程写在进度行上。
+    ★ 必须 `taskkill /F /T`：客户端会拉起 voice_worker 子进程（孙进程），
+      只杀父进程的话子进程继续攥着安装目录里的文件。
+    """
+    procs = list_related_processes(dirs)
+    if log_cb and procs:
+        log_cb("正在结束旧版本：" + "、".join(f"{n or '进程'} (PID {p})" for p, n, _e, _c in procs))
+    for pid, _name, _exe, _cmd in procs:
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           capture_output=True, timeout=25,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        except Exception:
+            pass
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if not any(_pid_alive(p[0]) for p in procs):
+            break
+        time.sleep(0.25)
+    time.sleep(0.4)                       # 让内核把文件句柄收干净，再开始覆盖
+    return procs, [p for p in procs if _pid_alive(p[0])]
+
+
+def locking_processes(paths):
+    """这些文件正被哪些进程占用：[(pid, 应用名)]。查不到就返回 []（不影响主流程）。
+
+    ★ 用 Windows 自带的 Restart Manager（`rstrtmgr.dll`，就是"文件被占用，请关闭
+      以下程序"那个对话框背后的 API）。为什么不自己猜：占用者可能是客户端、可能是
+      杀软、可能是索引服务 —— 猜不出来，但系统知道。实测它能把 PID + 应用名报出来。
+    """
+    paths = [os.path.abspath(p) for p in paths if p][:32]
+    if not paths:
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+        rm = ctypes.WinDLL("rstrtmgr")
+    except Exception:
+        return []
+
+    class RM_UNIQUE_PROCESS(ctypes.Structure):
+        _fields_ = [("dwProcessId", wintypes.DWORD),
+                    ("ProcessStartTime", wintypes.FILETIME)]
+
+    class RM_PROCESS_INFO(ctypes.Structure):
+        _fields_ = [("Process", RM_UNIQUE_PROCESS),
+                    ("strAppName", wintypes.WCHAR * 256),
+                    ("strServiceShortName", wintypes.WCHAR * 64),
+                    ("ApplicationType", ctypes.c_uint),
+                    ("AppStatus", wintypes.ULONG),
+                    ("TSSessionId", wintypes.DWORD),
+                    ("bRestartable", wintypes.BOOL)]
+
+    rm.RmStartSession.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD,
+                                  wintypes.LPWSTR]
+    rm.RmRegisterResources.argtypes = [wintypes.DWORD, wintypes.UINT,
+                                       ctypes.POINTER(wintypes.LPCWSTR), wintypes.UINT,
+                                       ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p]
+    rm.RmGetList.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.UINT),
+                             ctypes.POINTER(wintypes.UINT),
+                             ctypes.POINTER(RM_PROCESS_INFO),
+                             ctypes.POINTER(wintypes.DWORD)]
+    rm.RmEndSession.argtypes = [wintypes.DWORD]
+
+    handle = wintypes.DWORD()
+    key = ctypes.create_unicode_buffer(256)
+    if rm.RmStartSession(ctypes.byref(handle), 0, key) != 0:
+        return []
+    try:
+        arr = (wintypes.LPCWSTR * len(paths))(*paths)
+        if rm.RmRegisterResources(handle, len(paths), arr, 0, None, 0, None) != 0:
+            return []
+        need = wintypes.UINT(0)
+        have = wintypes.UINT(0)
+        reasons = wintypes.DWORD(0)
+        rc = rm.RmGetList(handle, ctypes.byref(need), ctypes.byref(have), None,
+                          ctypes.byref(reasons))
+        if rc not in (0, 234):            # 234 = ERROR_MORE_DATA（正常，第一次就是它）
+            return []
+        n = max(int(need.value), 1)
+        buf = (RM_PROCESS_INFO * n)()
+        have = wintypes.UINT(n)
+        if rm.RmGetList(handle, ctypes.byref(need), ctypes.byref(have), buf,
+                        ctypes.byref(reasons)) != 0:
+            return []
+        out = []
+        for i in range(int(have.value)):
+            pid = int(buf[i].Process.dwProcessId)
+            app = (buf[i].strAppName or "").strip()
+            if pid and pid != os.getpid():
+                out.append((pid, app))
+        return out
+    finally:
+        try:
+            rm.RmEndSession(handle)
+        except Exception:
+            pass
+
+
+def _backup_user_data(dst_root, file_list, tmp_dir):
+    """升级前把"用户自己的文件"存到临时目录（只存 payload 里也有的那几个）。"""
+    payload = {rel for _src, rel in file_list}
+    saved = []
+    for name in USER_DATA_NAMES:
+        if name not in payload:
+            continue                      # payload 里没有 → 本来就不会被覆盖
+        p = os.path.join(dst_root, name)
+        if not os.path.isfile(p):
+            continue
+        try:
+            os.makedirs(tmp_dir, exist_ok=True)
+            shutil.copy2(p, os.path.join(tmp_dir, name))
+            saved.append(name)
+        except OSError:
+            pass
+    return saved
+
+
+def _restore_user_data(dst_root, saved, tmp_dir):
+    """把刚才存起来的用户文件盖回去。返回真的盖回去的名单。"""
+    back = []
+    for name in saved:
+        try:
+            shutil.copy2(os.path.join(tmp_dir, name), os.path.join(dst_root, name))
+            back.append(name)
+        except OSError:
+            pass
+    return back
+
+
+_SINGLETON_HANDLE = None
+
+
+def ensure_single_instance():
+    r"""同一个向导只许跑一个。已在跑 → 返回 False。
+
+    ★ 2026-11-15 现场：用户连点了两次安装包，**两个向导同时往同一个目录复制**，
+      结果两边都在 `runtime\LICENSE.txt` 上撞 WinError 32，界面全卡死。
+      这不是"文件被占用"的锅，是自己撞自己。用命名互斥体挡在最前面。
+    """
+    try:
+        import ctypes
+        global _SINGLETON_HANDLE
+        _SINGLETON_HANDLE = ctypes.windll.kernel32.CreateMutexW(None, False,
+                                                               "Global\\VibeMoteSetupWizard")
+        return ctypes.windll.kernel32.GetLastError() != 183      # ERROR_ALREADY_EXISTS
+    except Exception:
+        return True
+
+
 # ★ 版本号只有一个真源（2026-11-15 踩过）：这里写死过一次 "1.3.1"，
 #   而 InstallerApp.APP_VERSION 已经升到 1.3.2 —— 结果 `_uninstall_info.json`
 #   里记的版本永远是旧的（卸载列表里显示错版本），而且发布前那道 e2e 闸门
 #   也跟着"假失败"。**升版本时只改这一行**（和 app.py 的 APP_VERSION 保持一致）。
-WIZARD_VERSION = "1.3.2"
+WIZARD_VERSION = "1.3.5"
 
 
 def write_uninstall_info(dst_root, app_name="VibeMote 遥控器", version=None):
@@ -349,6 +831,12 @@ class InstallerApp:
         # icacls 授权的结果（装完才知道）。None = 还没装 / 没跑。
         self._acl_ok = None
         self._acl_msg = ""
+        # 升级覆盖安装：上次装在哪 / 版本号 / 这次结束了哪些进程 / 保留了哪些用户文件
+        self._prev_dir, self._prev_src = find_previous_install()
+        self._prev_info = read_uninstall_info(self._prev_dir) if self._prev_dir else {}
+        self._stopped = []
+        self._kept = []
+        self._remembered = (False, False)
 
         self._build_banner()
         self.content = tk.Frame(self.root)
@@ -360,6 +848,14 @@ class InstallerApp:
         self._show_welcome()
 
     def _default_install_dir(self):
+        """默认装到**上次装的那个目录**（没有旧副本时才用 %PROGRAMFILES%）。
+
+        ★ 2026-11-15 用户反馈："我原来安装在 D 盘的，你现在没记住。"
+          升级覆盖安装的唯一正确默认值就是"原来的位置" —— 装到别处会变成两份，
+          用户桌面上的快捷方式还会指向旧的那份。
+        """
+        if self._prev_dir:
+            return self._prev_dir
         pf = os.environ.get("PROGRAMFILES", r"C:\Program Files")
         return os.path.join(pf, self.APP_NAME)
 
@@ -419,6 +915,21 @@ class InstallerApp:
         self.ent_dir.insert(0, self._install_dir)
         self.ent_dir.pack(side="left", fill="x", expand=True)
         tk.Button(row, text="浏览…", width=10, command=self._browse).pack(side="left", padx=(8, 0))
+
+        # ★ 升级覆盖安装：明确告诉用户"我认出你的旧版本了，就装在这里"
+        if self._prev_dir:
+            ver = self._prev_info.get("version") or "版本未知"
+            tk.Label(self.content,
+                     text=f"✓ 检测到已安装的旧版本（{ver}），已按上次的位置填好。\n"
+                          f"  来源：{self._prev_src}\n"
+                          "  直接点“下一步”= 升级覆盖安装：会自动结束正在运行的旧版，\n"
+                          "  保留你的 config.json（遥控器地址、按键映射、语音设置），"
+                          "其它文件覆盖成新版。",
+                     fg="#0a7a2f", wraplength=560, justify="left").pack(anchor="w", pady=(8, 0))
+        else:
+            tk.Label(self.content,
+                     text="（这台电脑上没找到已安装的旧版本，这是一次全新安装。）",
+                     fg="#666666", wraplength=560, justify="left").pack(anchor="w", pady=(8, 0))
 
         if self._size_bytes is None:
             self._size_bytes = dir_size(self._src_root)
@@ -511,12 +1022,26 @@ class InstallerApp:
         self.btn_next.config(text="完成", state="normal")
         self.btn_cancel.config(state="normal")
         tk.Label(self.content, text="安装完成", font=("Microsoft YaHei", 12, "bold")).pack(anchor="w", pady=(0, 10))
+
+        # 升级覆盖安装做了什么，当场说清楚（用户下次才不会怀疑"我的配置还在吗"）
+        bits = []
+        if self._stopped:
+            bits.append("已自动结束旧版本进程：" + "、".join(
+                f"{n or '进程'} (PID {p})" for p, n, _e, _c in self._stopped))
+        if self._kept:
+            bits.append("保留了你的 " + "、".join(self._kept) + "（升级没有覆盖配置）")
+        if bits:
+            tk.Label(self.content, text="\n".join(bits), fg="#0a7a2f",
+                     wraplength=560, justify="left").pack(anchor="w", pady=(0, 8))
+
         msg = (
             f"{self.APP_NAME} 已安装到：\n{self._install_dir}\n\n"
             "桌面和开始菜单里都有“启动遥控器”图标，双击即可启动。\n"
             "第一次启动后请做一件事：界面「设置」里点“扫描遥控器”，\n"
             "选中你自己的遥控器地址（安装包里没有预置任何地址）。"
         )
+        if self._remembered[0] or self._remembered[1]:
+            msg += "\n\n下次双击新版本安装包时，默认还是这个目录（已写进注册表）。"
         tk.Label(self.content, text=msg, justify="left", wraplength=560).pack(pady=(4, 8))
 
         # ★ 2026-11-13：授权失败必须当场说出来。否则用户后面看到的是
@@ -609,7 +1134,38 @@ class InstallerApp:
                 self.lbl_pct.config(text=f"{i * 100 // total}%")
                 self.root.update_idletasks()
 
-            install_files(src_root, self._install_dir, files, progress)
+            def say(text):
+                self.lbl_file.config(text=text)
+                self.lbl_pct.config(text="")
+                self.root.update_idletasks()
+
+            # ① 先停掉旧副本 —— 升级覆盖安装的第一步。
+            #    不做这一步，覆盖 runtime\ 里的文件就撞 [WinError 32]（用户 2026-11-15 的现场：
+            #    卡在 runtime\LICENSE.txt，"停止运行"只停了语音角色，客户端进程还活着）。
+            dirs = [self._install_dir]
+            if self._prev_dir and (os.path.normcase(os.path.normpath(self._prev_dir))
+                                   != os.path.normcase(os.path.normpath(self._install_dir))):
+                dirs.append(self._prev_dir)   # 用户改装了别的目录：旧那份也得停，否则它还占着端口
+            say("检查正在运行的 VibeMote …")
+            self._stopped, left = stop_running_instances(dirs, log_cb=say)
+            if left:
+                names = "、".join(f"{n or '进程'} (PID {p})" for p, n, _e, _c in left)
+                raise RuntimeError(
+                    "旧版本的 VibeMote 还在运行，结束不掉：" + names + "\n\n"
+                    "请手动关掉它（任务管理器 → 详细信息 → 结束 pythonw.exe），"
+                    "或者重启一次电脑后再双击安装包。\n"
+                    "（它占着安装目录里的文件，不关掉就覆盖不了）")
+
+            # ② 用户数据先存起来：payload 里的 config.json 是**模板**（遥控器地址为空），
+            #    直接覆盖 = 用户的地址/按键映射/语音设置全丢。升级不该动这些。
+            say("备份你的配置（config.json）…")
+            tmp_dir = tempfile.mkdtemp(prefix="vibemote_upgrade_")
+            saved = _backup_user_data(self._install_dir, files, tmp_dir)
+            try:
+                install_files(src_root, self._install_dir, files, progress)
+            finally:
+                self._kept = _restore_user_data(self._install_dir, saved, tmp_dir)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
             # ★ 2026-11-13：把安装目录授权给普通用户（Users = Modify）。
             #   不做这一步，装到 C:\Program Files 的普通用户写不了 config.json ——
@@ -630,6 +1186,10 @@ class InstallerApp:
 
             write_uninstall_info(self._install_dir, app_name=self.APP_NAME,
                                  version=self.APP_VERSION)
+
+            # ★ 记住这次的安装位置：下次双击新版本安装包时，默认目录就是这里
+            #   （用户 2026-11-15 报"我装 D 盘你没记住"的根治办法）。
+            self._remembered = remember_install_dir(self._install_dir)
 
             # 复制图标到安装目录（快捷方式用）
             try:
@@ -702,6 +1262,17 @@ class InstallerApp:
 
 def main():
     root = tk.Tk()
+    if not ensure_single_instance():
+        root.withdraw()
+        messagebox.showwarning(
+            "安装向导已经在运行",
+            "已经有一个安装向导窗口开着。\n\n"
+            "两个向导同时往同一个目录复制文件，会互相把文件锁住"
+            "（表现就是 [WinError 32] 卡在某个文件上）。\n\n"
+            "请先切到那个窗口（任务栏上的“VibeMote 遥控器 安装向导”），"
+            "或者关掉它再重新双击安装包。")
+        root.destroy()
+        return
     app = InstallerApp(root)
     root.mainloop()
 

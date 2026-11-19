@@ -64,13 +64,24 @@ FOUR_HITS_LIMIT = 3
 #   退出码 4 专门表示这一类（见 main() 结尾），主进程据此走"换进程阶梯"。
 CONNECT_FAIL_LIMIT = 45.0
 
+# ★ 2026-11-17：ATVV 被 Windows 拒绝（ACCESS_DENIED）也要换进程。
+#   真机 10:12~10:18：同一进程里连续 10 轮「已连接 → 只剩 4 个基础服务 → 缺少 ATVV
+#   → ACCESS_DENIED」，退避涨到 120 秒也一次没成功；10:19 重启客户端（换进程）后
+#   2 秒就 connected=True。原因：Windows 对这台遥控器的厂商服务（ab5e0001/ae40/
+#   d343bfc0，外加系统占的 1812 HID）保留独占占用，只有链路断开/换进程才释放。
+#   所以这条判据和「4 个服务」分开：它比 4 服务更确定（探针已经问过 Windows 真话）。
+DENIED_IDLE_LIMIT = 45.0
+DENIED_HITS_LIMIT = 2
+
 _out_lock = threading.Lock()
 stop_flag = threading.Event()
 
 
 def judge(now, connected, four_at, four_hits, down_since,
           four_idle=FOUR_IDLE_LIMIT, four_hits_limit=FOUR_HITS_LIMIT,
-          connect_fail=CONNECT_FAIL_LIMIT):
+          connect_fail=CONNECT_FAIL_LIMIT,
+          denied_at=0.0, denied_hits=0,
+          denied_idle=DENIED_IDLE_LIMIT, denied_hits_limit=DENIED_HITS_LIMIT):
     """worker 该不该退出、退出码是多少？返回 (why, code)，why 为空 = 继续干。
 
     纯函数（不碰时间、不碰全局），单测直接喂数就行 —— 这段判据是"换进程"的全部
@@ -79,9 +90,16 @@ def judge(now, connected, four_at, four_hits, down_since,
       four_at     本轮**第一次**见到"只有 4 个基础服务"的时刻（0 = 没见过）
       four_hits   本轮累计见到几次
       down_since  连续没连上的起点（0 = 一直连着）
+      denied_at   本轮**第一次**被 ACCESS_DENIED 的时刻（0 = 没被拒过）
+      denied_hits 本轮累计被拒几次
     """
     if connected:
         return "", 0
+    # ★ 被 ACCESS_DENIED 优先判：这种状态进程内救不回来，越早换进程越好。
+    if denied_hits >= denied_hits_limit:
+        return f"连续 {denied_hits} 次 ATVV 被 Windows 拒绝（ACCESS_DENIED）", 3
+    if denied_at and (now - denied_at) >= denied_idle:
+        return f"连续 {denied_idle:.0f} 秒 ATVV 被 Windows 拒绝（ACCESS_DENIED）", 3
     if four_at and (now - four_at) >= four_idle:
         return f"连续 {four_idle:.0f} 秒只有 4 个基础服务（ATVV 不在）", 3
     if four_hits >= four_hits_limit:
@@ -158,6 +176,10 @@ def main():
     #   why_box 用来把"为什么退出"从 stdin 线程传给主循环（poke 触发的提前退出）。
     four_at = [0.0]
     four_hits = [0]
+    # ★ 2026-11-17：ATVV 被 Windows 拒绝（ACCESS_DENIED）的计时/计数 —— 见 judge()。
+    #   denied_at 只记"本轮第一次"，和 four_at 同一个理由（别被每条日志刷新窗口）。
+    denied_at = [0.0]
+    denied_hits = [0]
     why_box = [""]
 
     def _mark_four():
@@ -165,20 +187,29 @@ def main():
             four_at[0] = time.time()
         four_hits[0] += 1
 
+    def _mark_denied():
+        if not denied_at[0]:
+            denied_at[0] = time.time()
+        denied_hits[0] += 1
+
     def on_event(kind, payload=None):
         if kind == "log":
             m = str(payload or "")
             if "缺少 ATVV 特征" in m or "只看到 4 个基础服务" in m:
                 _mark_four()
+            if "ACCESS_DENIED" in m or "被系统拒绝" in m:
+                _mark_denied()
             emit({"t": "log", "m": m})
         elif kind == "key":
             emit({"t": "key", "p": payload or {}})
         elif kind == "status":
             p = payload or {}
-            # 真正连上就把"4 个服务"的计时清零，避免成功之后再误判
+            # 真正连上就把"4 个服务 / 被拒"的计时清零，避免成功之后再误判
             if p.get("connected"):
                 four_at[0] = 0.0
                 four_hits[0] = 0
+                denied_at[0] = 0.0
+                denied_hits[0] = 0
             emit({"t": "status", "p": p})
 
     role = voice.VoiceRole(
@@ -249,7 +280,8 @@ def main():
             down_since = now
         # ★ 注意：只有 judge 给出理由时才覆盖 why —— 否则 "parent-stop" 会被空串
         #   盖掉，退出码就从 0 变成 3（测试 test_worker_rc4 抓到的）。
-        _why, _code = judge(now, False, four_at[0], four_hits[0], down_since)
+        _why, _code = judge(now, False, four_at[0], four_hits[0], down_since,
+                            denied_at=denied_at[0], denied_hits=denied_hits[0])
         if _why:
             why, code = _why, _code
             break

@@ -56,11 +56,12 @@ VOICE_TAP_DELAY_MS = 200  # 短按松开后等这么久确认不是双击，才�
 #   声音还在管道里没到。遥控器一松开就发 0x00（停），这时候如果马上抬
 #   Ctrl+Win，输入法立刻停录 → 管道里剩下的音频直接丢掉，表现就是"结尾被吃掉"。
 #   所以：松开后先别抬，只要还有音频帧在陆续到达就继续按住，等它们进完再抬。
-#   · 连续 VOICE_TAIL_IDLE_MS 没有新帧 → 抬（正常情况下音频本来就停了，等于没延迟）
-#   · 最多再按住 VOICE_TAIL_MAX_MS → 兜底，绝不把输入法面板挂在那儿
-#   配置项 `voice.tail_ms` 可覆盖上限（0 = 关掉这个行为，退回"松开立刻抬"）。
-VOICE_TAIL_IDLE_MS = 250    # 松开后：连续这么久没有新音频帧 → 抬键
-VOICE_TAIL_MAX_MS = 1500    # 松开后最多再按住这么久（= voice.tail_ms 的默认值）
+#   这里延长的是输入法接收时间，不能让已经停采集的遥控器继续采音。
+#   配置项 `voice.tail_ms` 是松开通知后的保持时间（0 = 立刻抬键）。
+VOICE_TAIL_MAX_MS = 1500
+# 0x00 通知可能比音频停下晚约一秒。短按没有音频时不能按旧的 400ms
+# 阈值判成假连，否则快速再次按下会被重连打断。
+VOICE_ZERO_FRAME_MIN_SESSION_S = 2.0
 
 
 def probe_mic(seconds=1.0):
@@ -251,6 +252,27 @@ FRAME_BYTES = 128
 # 所以 100 Hz 既安全又够用（ASR 前端一般 80–100 Hz 起）。
 # 实测不切的时候 0–50 Hz 占了 7.4% 的能量、还有 ±600 的直流漂移在带偏 AGC。
 HP_FC = 100.0
+
+def backoff_delay(fails, denied=0, no_addr=False):
+    """下一轮重连前等几秒（纯函数，便于单测）。
+
+    三档：
+      · `no_addr`       —— 还没填地址：10 秒（这不是"连不上"，别刷日志）
+      · `denied > 0`    —— ATVV 被 Windows 拒绝（ACCESS_DENIED）：30 秒起步，
+                           每轮 +30 秒，封顶 120 秒。这个状态在**进程内**救不回来
+                           （Windows 对厂商服务保留独占占用），10 秒一轮地抢那条
+                           唯一的 BLE 连接纯属自残：抢得越勤越连不上，还会把
+                           Windows 的 HID 宿主挤掉，连按键都跟着失灵。真正的自救是
+                           换进程/重启客户端（app.py 的看门狗负责，见 denied 判据）。
+      · 其它            —— 3 / 6 / 10 秒递增封顶 10 秒（用户要"像蓝牙鼠标一样
+                           按一下就能用"，退避太长体验就是"按了没反应"）。
+    """
+    if no_addr:
+        return 10.0
+    if int(denied or 0) > 0:
+        return min(30.0 * int(denied), 120.0)
+    return min(3.0 * (2 ** min(int(fails or 0), 2)), 10.0)
+
 
 STEP_TABLE = [
     7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
@@ -468,7 +490,9 @@ class Sink:
                     data = bytes(self.buf[:chunk])
                     del self.buf[:chunk]
                 else:
-                    data = silent
+                    # 把不足一个播放块的尾音补零输出，不让最后半块永远滞留。
+                    data = bytes(self.buf) + silent[:chunk - len(self.buf)]
+                    self.buf.clear()
                     self.underruns += 1
             try:
                 self.stream.write(data)
@@ -779,11 +803,18 @@ def cable_device_names():
 
 # ============================================================ 语音键
 def spec_to_vk(spec):
-    """{'mode','key','mods'} -> (mode, [修饰 VK], 主键 VK)；认不出返回 None。"""
+    """{'mode','key','mods'} -> (mode, [修饰 VK], 主键 VK)；认不出返回 None。
+
+    ★ 2026-11-18：微信输入法的预设是 key=LWIN + mods=[CTRL, LWIN]（即 Ctrl+Win）。
+      以前不排重，press() 会对同一个 LWIN 连发两次 key_down —— 日志写成
+      「按住 CTRL+LWIN+LWIN」，UI 也容易让人以为语音键是 Win 键。主键和修饰键
+      是同一个 VK 时只按一次，实际快捷键不变，表达干净。
+    """
     key = keys.vk_of(spec.get("key"))
     if not key:
         return None
-    mods = [v for v in (keys.vk_of(m) for m in (spec.get("mods") or [])) if v]
+    mods = [v for v in (keys.vk_of(m) for m in (spec.get("mods") or []))
+            if v and v != key]
     return (spec.get("mode") or "hold"), mods, key
 
 
@@ -804,8 +835,13 @@ class VoiceKey:
 
     @property
     def label(self):
-        names = [m for m in (self.spec.get("mods") or [])]
-        return "+".join(names + [str(self.spec.get("key") or "")])
+        # ★ 2026-11-18：修饰键里若已经包含主键（微信输入法 Ctrl+Win 的预设就是
+        #   key=LWIN / mods=[CTRL, LWIN]），label 里只写一次，免得日志和界面出现
+        #   「CTRL+LWIN+LWIN」这种看着像配错了的写法。
+        key = str(self.spec.get("key") or "")
+        names = [str(m) for m in (self.spec.get("mods") or [])
+                 if str(m).upper() != key.upper()]
+        return "+".join(names + [key])
 
     def press(self):
         if not self.ok or self.down:
@@ -946,6 +982,8 @@ class VoiceRole(threading.Thread):
         #    也就是说：救它只要"把这条连接丢掉重连"，代价约 1 秒；不救就得等 55 秒
         #    以上，而且这期间用户会以为遥控器坏了。
         self._reconnect_now = False         # 下一轮不要退避，立刻重连
+        self._denied = 0                    # ★ 2026-11-15：ATVV 被系统拒绝的连续轮数
+                                            #   （>0 时把重连间隔拉到 30~120 秒）
         self._zero_frame_sessions = 0       # 一共撞到几次「假连」（诊断用）
         self._session_t0 = 0.0              # 本次会话开始时刻（判「太短不算」）
         # ★ 2026-11-12：首帧 / 末帧时刻（monotonic）。真机统计发现「音频时长比按住
@@ -990,7 +1028,8 @@ class VoiceRole(threading.Thread):
         self._tap_timer = None        # 单击延迟计时器（等双击窗口过去）
         self._suppress = False        # 这一轮按下被判定为双击的第二下 → 什么都不做
         # ★ 2026-11-12：松开后"补录"用（见文件头 VOICE_TAIL_* 注释）
-        self._tail_timer = None       # 正在补录时的线程；None = 没在补录
+        self._tail_timer = None       # 可取消的延迟抬键事件
+        self._tail_lock = threading.RLock()
         self._tail_frames0 = 0        # 补录开始时的帧计数（统计多收了几帧）
         self._tail_t0 = 0.0           # 补录开始时刻（算实际等了多久）
         try:
@@ -999,6 +1038,19 @@ class VoiceRole(threading.Thread):
             self._tail_ms = VOICE_TAIL_MAX_MS
 
     # ---------- 对外 ----------
+    @property
+    def denied(self):
+        """ATVV 被 Windows 拒绝（ACCESS_DENIED）的**连续轮数**；0 = 正常。
+
+        ★ 2026-11-17：给 app.py 的语音看门狗用。
+          这个状态在**进程内**救不回来：Windows 对这台遥控器的 3 个厂商服务
+          （ab5e0001/ae40/d343bfc0，外加系统自己占的 1812 HID）保留独占占用，
+          进程里反复重连只会一直撞 ACCESS_DENIED（真机 10:12~10:18 连了 10 轮）。
+          换一个进程/重启客户端才是可靠的自救手段（实测 10:19 重启后 2 秒连上），
+          所以必须有这个计数器让看门狗自己动手，而不是让用户去取电池。
+        """
+        return int(getattr(self, "_denied", 0) or 0)
+
     def poke(self, reason="key"):
         """遥控器刚有按键活动 —— 现在它醒着，立刻重试一次连接。
 
@@ -1010,7 +1062,12 @@ class VoiceRole(threading.Thread):
           不能冒充"遥控器有按键活动" —— 真机 11:00~11:50 那 111 条"按键活动"
           对应的 `[按键]` 行数是 0，纯属日志骗人。
         """
-        self._poke_reason = str(reason or "key")
+        reason = str(reason or "key")
+        # 连接循环本身会按退避重试。看门狗不能每 10 秒把较长的退避打断；
+        # 已连接时的按键也不应留下一枚过期的重连信号。
+        if reason == "watchdog" or self.connected:
+            return
+        self._poke_reason = reason
         # ★ 2026-11-09：按键是**成功率最高**的时刻，顺手把"重新发现"的时间窗也清零，
         #   这样这一轮如果只看到 4 个服务，会立刻再试一次 UNCACHED（不必等 30 秒）。
         self._uncached_at = 0.0
@@ -1080,6 +1137,7 @@ class VoiceRole(threading.Thread):
         self._addr_warned = False
         self._no_addr = not new
         self._fails = 0
+        self._denied = 0                 # 换了地址就当全新开始，退避别带着旧账
         self.poke()                      # 停止退避，马上按新地址试一次
         return True
 
@@ -1093,6 +1151,8 @@ class VoiceRole(threading.Thread):
         self._emit("log", msg)
 
     def set_voice_spec(self, spec):
+        self._cancel_tail()
+        self.voice.release()
         self.voice_spec = spec or self.voice_spec
         self.voice = VoiceKey(self.voice_spec)
         # 手势字段也要跟着热更新，否则改了配置得重启客户端才生效
@@ -1244,8 +1304,8 @@ class VoiceRole(threading.Thread):
                 # 写成 any 的话，只要碰一下 Ctrl（很多组合键的修饰键）就开直通，
                 # 真实麦克风会被悄悄混进虚拟声卡里。
                 held = all(keys.key_is_down(v) for v in vks)
-                self.relay_obj.active_holder = bool(held) and not bool(
-                    getattr(self, "_active", False))
+                self.relay_obj.active_holder = (bool(held) and not self._active
+                                                and self._tail_timer is None)
             await asyncio.sleep(0.05)
 
     # ---------- 连接 ----------
@@ -1288,7 +1348,10 @@ class VoiceRole(threading.Thread):
                 self._log(f"语音：连接失败 {type(e).__name__}: {e}")
                 return False
         self._log(f"语音：连接超时（{timeout:.0f}s）—— 遥控器多半在休眠")
-        task.add_done_callback(lambda t: asyncio.ensure_future(self._reap(t, client)))
+        # 等待的是完整收尾，而不只是 connect 完成：迟到的连接还需要断开。
+        cleanup = asyncio.ensure_future(self._reap(task, client))
+        self._pending.add(cleanup)
+        cleanup.add_done_callback(lambda t: self._pending.discard(t))
         return False
 
     async def _pending_settled(self, timeout):
@@ -1347,7 +1410,8 @@ class VoiceRole(threading.Thread):
         except Exception:
             return
         try:
-            if client.is_connected and client is not self._client:
+            # 超时后这个 client 不再参与本轮；即使它仍是 self._client，也必须断开。
+            if client.is_connected:
                 await client.disconnect()
         except Exception:
             pass
@@ -1360,6 +1424,12 @@ class VoiceRole(threading.Thread):
         一条没关干净的会话（典型来源：connect 超时后那个迟到的连接），之后
         每次新连接都会被当成第二个客户端 —— 重连治不好，只有换进程才行。
         """
+        # 超时连接可能仍在后台 connect 或 disconnect。不能同时调用 disconnect、
+        # 关闭它的设备对象或创建新连接，否则又会产生互相争抢。
+        if not await self._pending_settled(8.0):
+            self.note = i18n.L("蓝牙通道还在释放，下一轮自动重连",
+                               "Releasing the Bluetooth channel; will retry next round")
+            return False
         c, self._client = self._client, None
         if c is not None:
             try:
@@ -1436,9 +1506,17 @@ class VoiceRole(threading.Thread):
                     f"Missing dependency ({e}) — install dependencies, then restart the client")
                 self._emit("status", {"connected": False, "note": self.note})
                 self._log(f"语音：{self.note}；本角色已停止（不会反复重试）")
+                self.connected = False
+                self._reset_voice_session()
+                await self._close_current()
                 return
             except Exception as e:
                 self._log(f"语音：连接异常 {type(e).__name__}: {e}")
+                self.connected = False
+                self.note = i18n.L("语音连接异常，正在重试", "Voice connection error; retrying")
+                self._session_ok = False
+                self._reset_voice_session()
+                await self._close_current()
                 hint = pairing_hint(type(e).__name__, str(e))
                 if hint and hint != getattr(self, "_last_hint", None):
                     self._last_hint = hint
@@ -1457,18 +1535,37 @@ class VoiceRole(threading.Thread):
                 # 还没填遥控器地址：这不是"连不上"，别拿它刷"已连续 N 次没连上"
                 # （新用户首启会看到这条，容易误读成程序坏了）。
                 fails = getattr(self, "_fails", 0)
-                delay = 10.0
+                delay = backoff_delay(fails, no_addr=True)
             else:
                 fails = 0 if getattr(self, "_session_ok", False) else getattr(self, "_fails", 0) + 1
                 self._fails = fails
-                delay = min(3.0 * (2 ** min(fails, 2)), 10.0)
+                denied = int(getattr(self, "_denied", 0) or 0)
+                # 已稳定连接后刚掉线：先快速试一次；若失败则恢复正常退避，
+                # 避免每轮都快速重连。后台未收尾的连接仍由 _close_current 串行保护。
+                delay = 0.5 if self._session_ok else backoff_delay(fails, denied)
+                # ★★ 2026-11-15：ATVV 被 Windows 拒绝（ACCESS_DENIED）时，10 秒一轮的
+                #   重连**一点用都没有**，而且每次都要去抢那条唯一的 BLE 连接 ——
+                #   真机实测（client.log 22:09~22:21）：每 11 秒连一次，连了十几分钟
+                #   一次也没成功，遥控器按键全程正常。链路坏了只有两条路能修：
+                #     ① 遥控器侧重新绑定：取电池 10 秒再装回；
+                #     ② Windows 侧重置加密：重启电脑。
+                #   所以把间隔拉到 30 秒起步、最长 120 秒（见 backoff_delay）：
+                #   既给用户时间去做上面两件事，也让蓝牙栈真正静下来。
+                if denied > 0 and (denied in (1, 3) or denied % 10 == 0):
+                    self._log(i18n.L(
+                        f"语音：ATVV 一直被系统拒绝（第 {denied} 轮）—— 重连间隔拉到 "
+                        f"{delay:.0f} 秒。进程内救不回来，看门狗会自动重启一次客户端"
+                        f"来释放它（不用你动手）。",
+                        f"Voice: ATVV is still blocked by Windows (round {denied}) — "
+                        f"backing off to {delay:.0f}s. This cannot be fixed in-process; "
+                        f"the watchdog will restart the client once to release it "
+                        f"(nothing to click)."))
                 if fails >= 8 and fails % 8 == 0:
-                    # ★ 2026-11-14：原来这里写"按住遥控器语音键 1 秒即可"，但 11:03 的
-                    #   实证是**按语音键叫不醒**（只枚举到 4 个服务 = Windows 对 ATVV
-                    #   回 ACCESS_DENIED），真正管用的是把电池取下 10 秒再装回。
+                    # ★ 2026-11-17：用户对"取电池 / 重启电脑"已经彻底厌倦（原话"都试过了"）。
+                    #   重新配对才是软件侧能给出的第一步，取电池只留作最后手段。
                     self._log(f"语音：已连续 {fails} 次没连上，退避到 {delay:.0f} 秒；"
-                              f"若一直这样：把遥控器电池取下 10 秒再装回"
-                              f"（软件侧叫不醒它，按语音键也没用）")
+                              f"若一直这样：按住【返回 + 主页】3 秒重新配对遥控器"
+                              f"（取电池只当最后手段）")
             # ★★ 2026-11-10 小柯：「假连」不退避，立刻重连（约 1 秒）。
             #   由 _on_status 的 0 帧分支置位（见本文件 ~1955 行）；心跳循环里也会
             #   看到它并提前 break，到这里时 delay 就会被压到 1 秒。
@@ -1671,10 +1768,14 @@ class VoiceRole(threading.Thread):
                 return
 
         if not ok:
+            # ★ 2026-11-17：原来这里劝用户点「重置蓝牙电台」。实测那会把链路重新
+            #   握手，ATVV 被 ACCESS_DENIED 时只会更糟（09:14 那次自动关开之后 ATVV
+            #   就再没回来）。所以统一成和首页同一套口诀：按键叫醒 → 重新配对 → 取电池最后。
             self.note = i18n.L(
-                "未连上（按一下遥控器任意键会重试；一直不行就点「重置蓝牙电台」）",
-                "Not connected (press any remote button to retry; if it keeps failing use "
-                "“Reset Bluetooth radio”)")
+                "未连上（按一下遥控器任意键会重试；一直不行就按住【返回 ←】+【主页 ⌂】"
+                "3 秒重新配对）",
+                "Not connected (press any remote button to retry; if it keeps failing, "
+                "hold BACK + HOME for 3 s to re-pair)")
             # ★★ 2026-11-09 小柯：这里原来是"连续 2 次叫不醒 → 换进程" ★★
             #   34 次实测证明深睡时换进程无效、浅睡时偶尔有效但要付 30~60 秒按键空窗，
             #   而且换进程过程中新旧实例会同时抢 GATT（旧实例的连接没断），反而更坏。
@@ -1765,39 +1866,53 @@ class VoiceRole(threading.Thread):
         if not (audio and status):
             self.misses += 1
             # ★★ 2026-11-14：先问 Windows 一句真话，再决定该说什么 ★★
-            #   bleak 会把 ACCESS_DENIED 的服务静默丢掉，所以「只剩 4 个」有两种
+            #   bleak 会把 ACCESS_DENIED 的服务静默丢掉，所以「ATVV 不在」有两种
             #   完全不同的原因，处理方式也完全不同：
-            #     · 遥控器真的只给 4 个（半睡）        → 按语音键 / 取电池
-            #     · Windows 有 8 个但 ATVV 被拒（ACCESS_DENIED）
-            #                                         → 绑定/加密链路坏了，
+            #     · 遥控器真的没开 ATVV（半睡）        → 按语音键 / 重新配对
+            #     · Windows 有它但被拒（ACCESS_DENIED）
+            #                                         → 进程里的独占占用没释放，
             #                                           按语音键按到天荒地老也没用，
-            #                                           必须删设备重新配对（或重启电脑）
+            #                                           只有换进程/重启客户端才松手
             #   这条探针 60 秒最多跑一次，不打扰重连节奏。
+            # ★ 2026-11-17：原来这里有个 `len(uuids) <= 4` 的门槛，**漏掉了真机遇到
+            #   的另一种形态**：10:36:18 那次枚举到 **6 个**服务（1800/1801/180a/
+            #   180f/ae40/d343bfc0，ATVV 就是不在）。服务数 >4 时探针根本不跑，
+            #   于是 denied 一直是 0 → 被判成"半睡" → 继续走 _maybe_unstick 关开
+            #   蓝牙电台（注释里早就写过这会把链路搞得更糟）。现在只要 ATVV 不在
+            #   就问一次真话，仍然 60 秒限流。
             truth = getattr(self, "_truth", None)
-            if len(uuids) <= 4 and (time.time() - float(
-                    getattr(self, "_truth_at", 0.0))) > 60.0:
+            if (time.time() - float(getattr(self, "_truth_at", 0.0))) > 60.0:
                 self._truth_at = time.time()
                 fresh = await gatt_truth(self.addr)
                 if fresh:
                     truth = self._truth = fresh
             atvv_denied = bool(truth and truth.get("atvv") == "DENIED")
+            # ★ 2026-11-15：记"被系统拒绝"的连续轮数，退避靠它拉长（见 _loop_sessions）。
             if atvv_denied:
+                self._denied = int(getattr(self, "_denied", 0) or 0) + 1
+            else:
+                self._denied = 0
+            if atvv_denied:
+                # ★ 2026-11-17：原来这里让用户"取电池 10 秒 / 重启电脑"——用户明确
+                #   说"都试过了"。真因是 Windows 对厂商服务保留独占占用，**换进程**
+                #   就能释放（10:19 重启客户端后 2 秒就连上了）。所以先把软件自救
+                #   说清楚，再给"实在不行"的下一步，别再让用户去拆电池。
                 self.note = i18n.L(
-                    "ATVV 被 Windows 拒绝（ACCESS_DENIED）—— 不是遥控器睡着，"
-                    "把遥控器电池取下 10 秒再装回（实测有效），不行再重启电脑",
-                    "ATVV is blocked by Windows (ACCESS_DENIED) — the remote is not "
-                    "asleep; take its battery out for 10 s and put it back (this works), "
-                    "then reboot if it still fails")
+                    "Windows 暂时拒绝访问 ATVV（ACCESS_DENIED），正在重试",
+                    "Windows temporarily denied access to ATVV (ACCESS_DENIED); retrying")
             else:
                 # ★ 2026-11-14：这条分支以前**从不设置 self.note**，于是界面一直显示
                 #   `未启动`（__init__ 的初值）—— 用户看到"就绪 / 未启动"，以为语音
                 #   没开，其实它每 10 秒在重连。note 必须跟着真实状态走。
+                # ★ 2026-11-17：服务数不一定是 4（真机见过 6 个：ae40/d343bfc0 在、
+                #   ATVV 不在），别再写死"4 个基础服务"；建议顺序也统一成
+                #   "按语音键 → 重新配对"，取电池只留最后。
                 self.note = i18n.L(
-                    "只看到 4 个基础服务（ATVV 不在）—— 按住语音键 2 秒叫醒它，"
-                    "一直不行就点「重置蓝牙电台」",
-                    "Only the 4 basic services are exposed (no ATVV) — hold the VOICE key for "
-                    "2 seconds to wake the remote; if it keeps failing, use "
-                    "“Reset Bluetooth radio”")
+                    f"ATVV 不在（本次只枚举到 {len(uuids)} 个服务）—— 按住语音键 2 秒"
+                    "叫醒它；一直不行就按住【返回 ←】+【主页 ⌂】3 秒重新配对",
+                    f"ATVV is missing (only {len(uuids)} services exposed) — hold the VOICE "
+                    "key for 2 s to wake the remote; if that keeps failing, hold "
+                    "BACK + HOME for 3 s to re-pair")
             # ★ 计入"卡住"计数（2026-11-06 修正）：这条路径以前从不增加 _stuck，
             #   导致 _maybe_unstick 永远触发不了，只能无限重连。
             self._stuck = getattr(self, "_stuck", 0) + 1
@@ -1810,17 +1925,11 @@ class VoiceRole(threading.Thread):
                     f"语音：Windows 说这台遥控器有 {truth['total']} 个服务，"
                     f"但 ATVV(ab5e0001) 被拒绝访问（ACCESS_DENIED）；"
                     f"能访问的只有 {', '.join(truth['ok']) or '无'}。"
-                    "这不是遥控器在睡觉 —— 它醒着，按键都正常 —— 是蓝牙的"
-                    "绑定/加密链路坏了，按语音键叫不醒它。"
-                    "修法：设置 → 蓝牙和其他设备 → 删除「Chromecast Remote」，"
-                    "再按住【返回 + 主页】重新配对；或者先重启一次电脑试试。",
+                    "可能与连接状态、服务访问或配对有关；软件会继续尝试恢复。",
                     f"Voice: Windows lists {truth['total']} services on this remote, but "
                     f"ATVV(ab5e0001) is ACCESS_DENIED (accessible: "
-                    f"{', '.join(truth['ok']) or 'none'}). The remote is awake — the "
-                    "Bluetooth bonding/encryption link is broken, so pressing the VOICE "
-                    "key cannot help. Fix: Settings > Bluetooth & devices > remove "
-                    "“Chromecast Remote”, then hold BACK + HOME to pair it again "
-                    "(or reboot once first)."))
+                    f"{', '.join(truth['ok']) or 'none'}). The connection, service access "
+                    "or pairing may be involved; the app will keep trying to recover."))
             if self.misses >= 3 and not atvv_denied:
                 self._log("语音：连续 3 次看不到 ATVV —— 蓝牙通道被占住，"
                           "正在自动释放通道并重试（不用重启客户端）")
@@ -1842,18 +1951,20 @@ class VoiceRole(threading.Thread):
                 #   所以这是**半睡**，不是没有硬件：别让用户白买一支新遥控器。
                 self._variant_hinted = True
                 self._log(i18n.L(
-                    "语音：遥控器这会儿只给出 4 个基础服务（1800/1801/180a/180f），"
-                    "ATVV 语音服务暂时不在线。这几乎都是遥控器进入了半睡省电，"
+                    f"语音：遥控器这会儿只给出 {len(uuids)} 个服务"
+                    f"（{', '.join(uuids) or '空'}），ATVV 语音服务暂时不在线。"
+                    "这几乎都是遥控器进入了半睡省电，"
                     "**不是这支遥控器没有语音硬件，也不用换遥控器**。"
-                    "叫醒它：按住【语音键】约 2 秒再松（按音量键、方向键不算），"
-                    "或者取下电池等 10 秒再装回。醒来后软件会自动连上。",
-                    "Voice: the remote is currently exposing only the 4 basic services "
-                    "(1800/1801/180a/180f); the ATVV voice service is temporarily offline. "
+                    "叫醒它：按住【语音键】约 2 秒再松（按音量键、方向键不算）；"
+                    "叫不醒就按住【返回 + 主页】3 秒重新配对（最后才取电池）。"
+                    "醒来后软件会自动连上。",
+                    f"Voice: the remote currently exposes only {len(uuids)} services "
+                    f"({', '.join(uuids) or 'none'}); the ATVV voice service is offline. "
                     "This almost always means the remote went into a half-sleep power-saving "
                     "state — it does **not** mean this remote lacks voice hardware, and you "
                     "do not need to replace it. Wake it: hold the VOICE key for about 2 "
-                    "seconds and release (volume or dpad keys do not count), or take the "
-                    "battery out for 10 seconds and put it back."))
+                    "seconds and release (volume or dpad keys do not count); if that fails, "
+                    "hold BACK + HOME for 3 s to re-pair (battery removal is the last resort)."))
             # ★★ 2026-11-09 小柯：这里原来是"连续 2 轮只剩 4 个服务 → 换进程" ★★
             #   实测（client.log 20:33~22:36）深睡时换进程完全无效：22:18:39、
             #   22:26:23、22:27:42 三次全新进程照样只有 4 个服务；浅睡时偶尔有效，
@@ -1863,8 +1974,8 @@ class VoiceRole(threading.Thread):
             try:
                 self._four_streak = getattr(self, "_four_streak", 0) + 1
                 if self._four_streak >= 2 and not atvv_denied:
-                    self._wake_hint(i18n.L("遥控器只剩 4 个基础服务（ATVV 不在）",
-                                           "the remote exposes only the 4 basic services (no ATVV)"))
+                    self._wake_hint(i18n.L("遥控器的服务表不全（ATVV 不在）",
+                                           "the remote is not exposing ATVV"))
             except Exception as _e2:
                 self._log(f"语音：提示判断出错 {type(_e2).__name__}: {_e2}")
             await self._close_current()
@@ -1872,12 +1983,8 @@ class VoiceRole(threading.Thread):
 
         self.misses = 0
         self._stuck = 0                     # ★ 真正拿到 ATVV 才算这次成功（2026-11-06）
-        self._session_ok = True             # ★ 2026-11-08：真正能用才算成功，退避才归零
+        self._denied = 0                    # ★ 2026-11-15：连上就清零，退避立刻回到 3 秒
         self._uncached_at = 0.0             # ★ 2026-11-09：成功一次就清零，下次"只剩 4 个"能立刻重发现
-        self.connected = True
-        self.note = i18n.L("已连接", "Connected")
-        self._emit("status", {"connected": True, "note": self.note,
-                              "battery": self.battery})
         if self.sink:
             self.sink.reset()
 
@@ -1908,6 +2015,13 @@ class VoiceRole(threading.Thread):
         # 音频订阅必须先于状态订阅，避免丢掉起始帧
         await client.start_notify(audio, on_audio)
         await client.start_notify(status, on_status)
+        # 两项订阅均成功之后才对外宣告可用；否则异常处理会清理并重试。
+        self._poke.clear()
+        self._session_ok = True
+        self.connected = True
+        self.note = i18n.L("已连接", "Connected")
+        self._emit("status", {"connected": True, "note": self.note,
+                              "battery": self.battery})
         if ctl:
             try:
                 await client.write_gatt_char(ctl, bytes([0x0A, 0x00, 0x04, 0x00, 0x01]),
@@ -1966,7 +2080,7 @@ class VoiceRole(threading.Thread):
 
         try:
             while not self.stop_flag.is_set():
-                if not client.is_connected:
+                if disc.is_set() or not client.is_connected:
                     self._log("语音：连接已断开")
                     break
                 # ★★ 2026-11-10 小柯：「假连」立刻重连（真机 13:51 实锤）。
@@ -2015,8 +2129,7 @@ class VoiceRole(threading.Thread):
         finally:
             self.connected = False
             self.note = i18n.L("已断开", "Disconnected")
-            self._cancel_tail()
-            self.voice.release()
+            self._reset_voice_session()
             await self._close_current()
 
     # ---------- 语音键手势（长按 = 说话，双击 = 第二个动作） ----------
@@ -2076,72 +2189,53 @@ class VoiceRole(threading.Thread):
 
     # ---------- 松开后的「补录」（见文件头 VOICE_TAIL_* 注释） ----------
     def _cancel_tail(self):
-        """取消正在进行的补录（用户又按下 / 线程要退出时调用）。"""
-        t = self._tail_timer
-        self._tail_timer = None
-        if t is not None:
-            try:
-                t.cancel()
-            except Exception:
-                pass
+        """取消待抬键任务；同步保证旧任务不能抬起新会话的键。"""
+        with self._tail_lock:
+            t, self._tail_timer = self._tail_timer, None
+            if t is not None:
+                t.set()
 
     def _release_with_tail(self):
-        """结束「按住说话」：默认立刻抬键；开着补录就先等管道里剩下的音频进完。
-
-        为什么不能只按"固定延时"做：真机上 1.4 秒的缺口可能出现在**开头**
-        （麦克风起振慢，那部分声音根本不存在，等多久也没用）也可能出现在
-        **结尾**（还在管道里传）。用"最后一帧音频到了多久"来判：
-          · 松开时已经 1.4 秒没有新帧 → 管道是空的，立刻抬键（零代价）
-          · 松开后还有帧陆续到 → 继续按住，直到它们停 VOICE_TAIL_IDLE_MS
-        上限 `voice.tail_ms` 兜底，绝不会把输入法面板挂在那儿。
-        """
+        """松开通知后保持输入法开启一段时间，让已收到的尾音播放完。"""
         self._cancel_tail()
         if self._tail_ms <= 0:
             self.voice.release()
             return
-        frames0 = self._session_frames
-        t0 = time.monotonic()
+        cancel = threading.Event()
+        with self._tail_lock:
+            self._tail_timer = cancel
 
         def _worker():
-            while not self.stop_flag.is_set():
-                time.sleep(0.05)
-                now = time.monotonic()
-                last = self._last_frame_at or 0.0
-                idle_ms = (now - last) * 1000.0 if last else 1e9
-                if idle_ms >= VOICE_TAIL_IDLE_MS or (now - t0) * 1000.0 >= self._tail_ms:
-                    break
-            extra = self._session_frames - frames0
-            # 出口还有待播缓冲（约 200ms）：抬键前先让它流干净，否则最后这 200ms
-            # 会被输入法"停录"挡在虚拟声卡里 —— 白补。
-            # ★ 判据是「不足一个播放块（20ms）」而不是「空」：Sink 每帧只产出
-            #   1920 字节、而播放块是 3840 字节，缓冲区永远会剩 1920 字节不被
-            #   取走 —— 用 ">0" 判的话每次都撞满 350ms 上限（实测每次都等 422ms）。
-            sink = self.sink
-            if sink is not None:
-                one_block = int(SR_OUT * 0.02) * 4
-                drain_t0 = time.monotonic()
-                while ((time.monotonic() - drain_t0) < 0.35
-                       and len(getattr(sink, "buf", b"")) >= one_block):
-                    time.sleep(0.02)
-            waited = (time.monotonic() - t0) * 1000.0
-            self.voice.release()
-            if extra > 0:
-                self._log(f"语音：松开后又等了 {waited:.0f}ms，补收 {extra} 帧"
-                          f"（≈ {extra / 62.5:.2f}s 结尾音频）")
-            elif waited >= 300:
-                # 等了这么久一帧都没补到 → 缺口不在"管道里还没到"，而是遥控器
-                # 根本没把这段送出来（麦克风起振慢 / 松开就停编码）。记一笔，别再猜。
-                self._log(f"语音：松开后等了 {waited:.0f}ms，没补到帧"
-                          f"（结尾缺的那段遥控器没送出来，不是被我们掐掉的）")
+            if cancel.wait(self._tail_ms / 1000.0):
+                return
+            with self._tail_lock:
+                if self._tail_timer is cancel and not self.stop_flag.is_set():
+                    self.voice.release()
+                    self._tail_timer = None
 
         t = threading.Thread(target=_worker, daemon=True, name="VoiceTail")
-        self._tail_timer = t
         t.start()
+
+    def _reset_voice_session(self):
+        """断线或停止时清除旧会话，防止重连后首次按下被忽略。"""
+        self._cancel_tail()
+        self._disarm_long()
+        self._cancel_tap_timer()
+        was_active = self._active
+        self._active = False
+        self._long_fired = False
+        self._suppress = False
+        self._last_tap = 0.0
+        self.voice.release()
+        if was_active:
+            self._emit("key", {"id": "voice", "down": False})
 
     # ---------- 语音键事件 ----------
     def _on_status(self, b: bytes):
         active = getattr(self, "_active", False)
         if b[0] == 0x04 and not active:
+            # 如果上一段刚判为零帧，用户已经开始下一段时不要主动断开它。
+            self._reconnect_now = False
             self._cancel_tail()                 # 又按下了：上一轮的补录到此为止
             self._active = True
             self.sessions += 1
@@ -2199,10 +2293,10 @@ class VoiceRole(threading.Thread):
             else:
                 timing = "首帧 无（这段没音频）"
             self._log(f"语音：▲ 结束（本段 {n} 帧音频 ≈ {n / 62.5:.1f}s；{timing}）")
-            if n == 0 and dur >= 0.4:
+            if n == 0 and dur >= VOICE_ZERO_FRAME_MIN_SESSION_S:
                 # ★ 按了这么久、一个音频帧都没有 → 这条连接是「假连」（见 __init__）。
                 #   立刻标脏，主循环马上断开重连（约 1 秒），不用用户再按一次。
-                #   `dur >= 0.4` 是防止"极短的一下轻碰"被误判成假连。
+                #   设备的结束通知可能延迟，短按的零帧不代表连接坏了。
                 self._zero_frame_sessions += 1
                 self._reconnect_now = True
                 self._log(i18n.L(
@@ -2237,8 +2331,7 @@ class VoiceRole(threading.Thread):
           → join 线程。调用方（重启/重建）可以安全地接着 new 新的 VoiceRole。
         """
         self.stop_flag.set()
-        self._cancel_tail()
-        self.voice.release()
+        self._reset_voice_session()
         loop = getattr(self, "_loop", None)
         if loop is not None:
             try:
@@ -2334,6 +2427,10 @@ class VoiceWorkerRole(threading.Thread):
         self._last_recycle_at = 0.0
         self._child_pid = 0
         self._last_why = ""
+        # ★ 2026-11-17：ATVV 被 Windows 拒绝（ACCESS_DENIED）的连续轮数。
+        #   worker 模式下 BLE 在子进程里，主进程只能从转发的日志里数出来；
+        #   app.py 的看门狗拿它判断"要不要重启整个客户端"。
+        self._denied = 0
         self.sessions = 0
         self.frames = 0
 
@@ -2373,6 +2470,15 @@ class VoiceWorkerRole(threading.Thread):
         才说明换进程这招用尽，值得重启整个客户端。
         """
         return self._snapshot_respawns
+
+    @property
+    def denied(self):
+        """ATVV 被 Windows 拒绝（ACCESS_DENIED）的连续轮数；0 = 正常。
+
+        与 VoiceRole.denied 同义：app.py 的看门狗用它决定"要不要重启整个客户端"。
+        worker 进程里的连接细节主进程看不到，只能从转发上来的日志数。
+        """
+        return int(self._denied or 0)
 
     def poke(self, reason="key"):
         """遥控器刚有按键活动：转发给 worker，让它**立刻**重试连接。
@@ -2517,7 +2623,12 @@ class VoiceWorkerRole(threading.Thread):
     def _handle(self, obj):
         t = obj.get("t")
         if t == "log":
-            self._log(str(obj.get("m") or ""))
+            m = str(obj.get("m") or "")
+            # ★ 2026-11-17：ATVV 被 Windows 拒绝的日志每轮一条 —— 数出来给看门狗用
+            #   （见 denied 属性）。worker 里的连接细节主进程看不到，只能从这里数。
+            if "ACCESS_DENIED" in m or "被系统拒绝" in m:
+                self._denied = int(self._denied or 0) + 1
+            self._log(m)
         elif t == "key":
             p = obj.get("p") or {}
             if p.get("down"):
@@ -2532,6 +2643,8 @@ class VoiceWorkerRole(threading.Thread):
             if self._connected:
                 # 真连上了 → 「连不上」阶梯从头算
                 self._cf_level = 0
+                # 被 ACCESS_DENIED 的连续轮数也要清零（否则下次偶发一轮就误判）
+                self._denied = 0
             self._note = p.get("note") or self._note
             b = p.get("battery")
             if isinstance(b, int) and 0 <= b <= 100:

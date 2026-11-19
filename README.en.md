@@ -10,10 +10,13 @@ cable → your IME types the text**. 14 buttons are freely remappable —
 **Download → unzip → double-click `启动遥控器.vbs`.** There is no fourth step (the offline package
 bundles Python, so the target machine needs nothing installed).
 
-> ⬇️ **[Download the latest release](releases/latest)** — the asset is `VibeMote_Setup_win64_v1.3.2.zip`
+> ⬇️ **[Download the latest release](releases/latest)** — the asset is `VibeMote_Setup_win64_v1.3.5.zip`
 > (89 MB zipped, ~200 MB unpacked): **unzip → double-click `VibeMote_Setup.exe` inside**, one UAC and it
 > installs to `C:\Program Files\VibeMote 遥控器` (bundles the Python runtime + the official virtual-audio-cable
 > files; **the target machine needs no Python and no network**). Reboot once, then click “启动遥控器” on the desktop.
+> Upgrading (since v1.3.3): it **reuses the previous install directory** (no longer defaults to C:),
+> **stops the running instance** before copying, and **keeps your `config.json`** (remote address,
+> key mappings, voice settings).
 > · Voice only, no frida on your system → build your own light package (routes A–D below); no prebuilt download here.
 > Changelog → [`CHANGELOG.md`](CHANGELOG.md) ·
 > Want an AI to install it for you → give it the repo URL together with [`AGENTS.en.md`](AGENTS.en.md)

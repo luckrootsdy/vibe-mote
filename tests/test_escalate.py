@@ -62,6 +62,26 @@ check("judge 常量 45 秒 / 20 秒 / 3 次没被改坏",
        voice_worker.FOUR_HITS_LIMIT) == (45.0, 20.0, 3),
       (voice_worker.CONNECT_FAIL_LIMIT, voice_worker.FOUR_IDLE_LIMIT,
        voice_worker.FOUR_HITS_LIMIT))
+# ★ 2026-11-17：ATVV 被 Windows 拒绝（ACCESS_DENIED）→ 换进程（退出码 3）
+check("judge 被拒 2 轮 → 退出码 3（不等 45 秒）",
+      J(1000.0, False, 0.0, 0, 999.0, denied_at=998.0, denied_hits=2)[1] == 3)
+check("judge 被拒 1 轮 → 继续（偶发不换进程）",
+      J(1000.0, False, 0.0, 0, 999.0, denied_at=998.0, denied_hits=1) == ("", 0))
+check("judge 被拒 46 秒 → 退出码 3",
+      J(1000.0, False, 0.0, 0, 999.0, denied_at=954.0, denied_hits=1)[1] == 3)
+check("judge 被拒 44 秒 → 继续",
+      J(1000.0, False, 0.0, 0, 999.0, denied_at=956.0, denied_hits=1) == ("", 0))
+check("judge 被拒的理由里写明 ACCESS_DENIED",
+      "ACCESS_DENIED" in J(1000.0, False, 0.0, 0, 999.0, denied_at=900.0,
+                           denied_hits=2)[0])
+check("judge 被拒优先于「4 个服务」",
+      J(1000.0, False, 950.0, 3, 900.0, denied_at=900.0, denied_hits=2)[0].find(
+          "ACCESS_DENIED") >= 0)
+check("judge 连上时被拒计数不参与",
+      J(1000.0, True, 900.0, 9, 0.0, denied_at=900.0, denied_hits=9) == ("", 0))
+check("judge 被拒常量 45 秒 / 2 轮没被改坏",
+      (voice_worker.DENIED_IDLE_LIMIT, voice_worker.DENIED_HITS_LIMIT) == (45.0, 2),
+      (voice_worker.DENIED_IDLE_LIMIT, voice_worker.DENIED_HITS_LIMIT))
 
 # ---------- 2. watch_escalate()：什么时候重启整个客户端 ----------
 E = app.watch_escalate
@@ -77,6 +97,21 @@ check("escalate 阈值就是 180/600/3/2",
       (app.ESC_AFTER, app.ESC_GAP, app.ESC_MAX, app.ESC_MIN_RESPAWNS)
       == (180.0, 600.0, 3, 2),
       (app.ESC_AFTER, app.ESC_GAP, app.ESC_MAX, app.ESC_MIN_RESPAWNS))
+# ★ 2026-11-17：ACCESS_DENIED 单独一条阶梯 —— 主进程内跑语音时 respawns 恒为 0，
+#   老判据永远不成立（真机 10:12~10:18 就是这样卡住，只能手动重启客户端）。
+check("escalate 被拒 2 轮 + 断开 60 秒 + respawns=0 → 重启（这是本次修复的核心）",
+      E(60, 0, 0, 1e9, denied=2) is True)
+check("escalate 被拒 2 轮但只断开 59 秒 → 再等等", E(59, 0, 0, 1e9, denied=2) is False)
+check("escalate 只被拒 1 轮 → 不动（偶发）", E(500, 0, 0, 1e9, denied=1) is False)
+check("escalate 被拒也要受限次：已重启 3 次 → 不动",
+      E(500, 0, 3, 1e9, denied=9) is False)
+check("escalate 被拒也要受限流：距上次 300 秒 → 不动",
+      E(500, 0, 1, 300, denied=9) is False)
+check("escalate 没被拒时仍要求换过 2 次进程（不误伤设备睡着）",
+      E(500, 0, 0, 1e9, denied=0) is False)
+check("escalate 被拒阈值就是 60 秒 / 2 轮",
+      (app.ESC_DENY_AFTER, app.ESC_DENY_HITS) == (60.0, 2),
+      (app.ESC_DENY_AFTER, app.ESC_DENY_HITS))
 
 # ---------- 2b. 自动重启计数要跨进程（否则每 10 分钟重启一次客户端） ----------
 _tmp = os.path.join(r"D:\TEMP\opencode", "_auto_recovery_test.json")
@@ -116,6 +151,22 @@ check("连上 → connected 状态同步", role.connected is True)
 role._handle({"t": "status", "p": {"connected": False, "note": "x"}})
 check("断开不会误清零阶梯（保持 0，等下次判据累加）", role._cf_level == 0)
 
+# ★ 2026-11-17：worker 模式下的 denied 计数（主进程从转发日志里数）
+check("新 worker 的 denied = 0", role.denied == 0)
+role._handle({"t": "log", "m": "语音：Windows 说这台遥控器有 8 个服务，"
+                                "但 ATVV(ab5e0001) 被拒绝访问（ACCESS_DENIED）"})
+check("日志里出现 ACCESS_DENIED → denied 累加", role.denied == 1, role.denied)
+role._handle({"t": "log", "m": "语音：ATVV 一直被系统拒绝（第 2 轮）"})
+check("「被系统拒绝」也计入 denied", role.denied == 2, role.denied)
+role._handle({"t": "status", "p": {"connected": True}})
+check("连上 → denied 清零", role.denied == 0, role.denied)
+
+# VoiceRole（默认的进程内模式）也要有同名接口，否则看门狗读不到
+_vr = voice.VoiceRole(lambda k, p=None: None, addr="")
+check("VoiceRole.denied 初值 0", _vr.denied == 0)
+_vr._denied = 3
+check("VoiceRole.denied 读的是 _denied", _vr.denied == 3)
+
 # 退避阶梯本身（读源码，防止有人把 2/15/30/60/120 改回 60/120/300）
 src = io.open(os.path.join(ROOT, "voice.py"), encoding="utf-8").read()
 check("voice.py 里有连不上换进程的退避阶梯 [2,15,30,60,120]",
@@ -127,6 +178,30 @@ check("worker 的退出码 4 接线还在",
 check("app.py 自动重启走 launch_new_instance（与手动重启同一条路）",
       "ok, msg = launch_new_instance()" in io.open(
           os.path.join(ROOT, "app.py"), encoding="utf-8").read())
+
+# ---------- 4. 源码守卫：ACCESS_DENIED 自救链真的接上了 ----------
+_app = io.open(os.path.join(ROOT, "app.py"), encoding="utf-8").read()
+check("watch_voice 把 denied 传给 watch_escalate", "denied=denied" in _app)
+check("watch_voice 读的是角色的 denied", 'getattr(v, "denied"' in _app)
+check("被拒时的日志说清「换进程释放独占占用」", "独占占用" in _app)
+check("voice.py 的 ACCESS_DENIED 提示：软件自动重启 + 取电池只当最后手段",
+      "看门狗会自动重启一次客户端" in src and "取电池只当最后手段" in src)
+check("voice.py 不再说「这种状态软件侧救不回来」",
+      "软件侧救不回来" not in src)
+check("voice_worker.py 的 denied 判据接线还在",
+      "denied_at=denied_at[0]" in io.open(
+          os.path.join(ROOT, "voice_worker.py"), encoding="utf-8").read())
+check("自动重启到上限后要明说「停止自动重启」", "停止自动重启" in _app)
+# ★ 2026-11-17：探针门槛必须去掉 —— 真机见过「枚举到 6 个服务但 ATVV 不在」，
+#   带 `len(uuids) <= 4` 时探针不跑、denied 永远是 0，会被误判成"半睡"。
+check("ATVV 不在时探针无条件跑（没有 len(uuids)<=4 门槛）",
+      "len(uuids) <= 4 and" not in src)
+check("提示不再写死「4 个基础服务」", "ATVV 不在（本次只枚举到" in src)
+# ★ 2026-11-17：计划内重启（restart-app / 自动恢复 / 提权重启）走不到 main 末尾的
+#   "删 RUNSTATE"，新实例会把这次**正常**重启误报成「上次没有正常退出，可能崩溃/
+#   被强杀」。判据用 `--takeover`（只有本软件的重启会带它，快捷方式启动不带）。
+check("计划内重启不再误报「上次没有正常退出」",
+      'restarted = bool(getattr(args, "takeover", False))' in _app)
 
 print()
 if fails:
