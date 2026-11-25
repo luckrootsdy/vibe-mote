@@ -8,7 +8,7 @@
 
 **下载 → 解压 → 双击 `启动遥控器.vbs`**，没有第四步（离线包自带 Python，目标机器不需要装任何东西）。
 
-> ⬇️ **[下载最新版](releases/latest)** —— 附件是 `VibeMote_Setup_win64_v1.3.6.zip`（89 MB 压缩，
+> ⬇️ **[下载最新版](releases/latest)** —— 附件是 `VibeMote_Setup_win64_v1.3.7.zip`（89 MB 压缩，
 > 解开约 200 MB）：**解压 → 双击里面的 `VibeMote_Setup.exe`**，一次 UAC 装到
 > `C:\Program Files\VibeMote 遥控器`（自带 Python 运行时 + 虚拟声卡原文件，**目标机不用装 Python、不用联网**）。
 > 升级（v1.3.3 起）：会**沿用上次的安装目录**（不再默认 C 盘）、**自动结束旧实例**再覆盖，
